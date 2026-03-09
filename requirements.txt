@@ -1,5 +1,5 @@
 flask==3.0.3
 pymysql==1.1.1
-pymysqlreplication==0.45.1
+pymysqlreplication
 requests==2.32.3
 cohere==5.11.4
