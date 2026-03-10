@@ -681,7 +681,7 @@ async function loadFiles() {
     }
 
     grid.innerHTML = data.files.map((f, i) => `
-      <a class="file-card" href="/tool/fetch/viewer/${encodeURIComponent(f.name)}" target="_blank" rel="noopener">
+      <a class="file-card" href="/viewer/${encodeURIComponent(f.name)}" target="_blank" rel="noopener">
         <div class="file-icon">📂</div>
         <div class="file-info">
           <div class="file-name">${f.name}</div>
@@ -1306,3 +1306,4 @@ if __name__ == "__main__":
     print(f"  ⚡  Press Ctrl+C to stop\n")
 
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+
