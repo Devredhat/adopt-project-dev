@@ -381,6 +381,9 @@ setInterval(checkStatus,5000);
 
 @home_app.before_request
 def check_ip():
+    # Skip check for debug endpoint
+    if request.path == "/myip":
+        return None
     # Get real IP (Render uses proxy)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     if ip: ip = ip.split(",")[0].strip()
@@ -401,6 +404,18 @@ def home():
 @home_app.route("/ping")
 def ping():
     return Response("pong", mimetype="text/plain")
+
+@home_app.route("/myip")
+def myip():
+    import json
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    all_headers = {k: v for k, v in request.headers}
+    return Response(json.dumps({
+        "remote_addr": request.remote_addr,
+        "x_forwarded_for": request.headers.get("X-Forwarded-For"),
+        "cf_connecting_ip": request.headers.get("CF-Connecting-IP"),
+        "real_ip": ip
+    }, indent=2), mimetype="application/json")
 
 @home_app.route("/api/status")
 def api_status():
