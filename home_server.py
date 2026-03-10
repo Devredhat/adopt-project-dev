@@ -54,6 +54,16 @@ def keep_alive():
 from flask import Flask, Response, request
 import requests as req
 
+def is_allowed(ip):
+    """Allow only ZeroTier network IPs"""
+    allowed_ranges = [
+        "10.150.",   # ZeroTier network
+    ]
+    for r in allowed_ranges:
+        if ip.startswith(r):
+            return True
+    return False
+
 home_app = Flask(__name__)
 
 TOOLS = {
@@ -368,6 +378,21 @@ setInterval(checkStatus,5000);
 </html>"""
 
 # ── Routes ─────────────────────────────────────────────────
+
+@home_app.before_request
+def check_ip():
+    # Get real IP (Render uses proxy)
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if ip: ip = ip.split(",")[0].strip()
+    if not is_allowed(ip):
+        return Response(
+            """<!DOCTYPE html><html><body style="background:#000;color:#111;
+            font-family:monospace;display:flex;align-items:center;justify-content:center;
+            height:100vh;font-size:12px">
+            &nbsp;
+            </body></html>""",
+            status=200, content_type="text/html"
+        )
 
 @home_app.route("/")
 def home():
