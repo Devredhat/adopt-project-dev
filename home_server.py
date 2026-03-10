@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================
-#  ADOPT Infrastructure Suite — Master Server
-#  Runs ALL 4 tools in one process (required for Railway)
-#
-#  Tool 1 (Binlog Monitor)   → thread → port 5000
-#  Tool 2 (Binlog Reader)    → thread → port 7777
-#  Tool 3 (Database + AI)    → thread → port 7000
-#  Home   (Navbar Hub)       → main   → port 8080 (or $PORT)
-#
-#  USAGE (local):
-#    python home_server.py
-#    Open: http://localhost:8080
-#
-#  USAGE (Railway):
-#    Just push to GitHub — Railway auto-detects PORT env var
+#  ADOPT Infrastructure Suite — Master Server (Fixed)
+#  Fix 1: Keep-alive ping (no more sleep)
+#  Fix 2: Proxy API calls correctly (no JSON parse errors)
+#  Fix 3: Better iframe loading
 # ============================================================
 
 import threading
@@ -21,14 +11,12 @@ import os
 import sys
 import time
 
-# Railway gives ONE port via $PORT env variable
 PORT = int(os.environ.get("PORT", 8080))
 
 # ─────────────────────────────────────────────────────────────
 #  START TOOL SERVERS IN BACKGROUND THREADS
 # ─────────────────────────────────────────────────────────────
 def start_tool_1():
-    """Start Live Binlog Monitor on port 5000"""
     try:
         import binray_Log_db as t1
         print("  [Tool 1] Binlog Monitor starting on port 5000...")
@@ -41,7 +29,6 @@ def start_tool_1():
         print(f"  [Tool 1] Failed: {e}")
 
 def start_tool_2():
-    """Start Binlog File Reader on port 7777"""
     try:
         import fetch_binlog_files as t2
         print("  [Tool 2] Binlog File Reader starting on port 7777...")
@@ -51,7 +38,6 @@ def start_tool_2():
         print(f"  [Tool 2] Failed: {e}")
 
 def start_tool_3():
-    """Start Database + AI on port 7000"""
     try:
         import database_tool as t3
         print("  [Tool 3] Database AI starting on port 7000...")
@@ -61,6 +47,20 @@ def start_tool_3():
     except Exception as e:
         print(f"  [Tool 3] Failed: {e}")
 
+# ─────────────────────────────────────────────────────────────
+#  KEEP ALIVE — ping self every 10 min so Render never sleeps
+# ─────────────────────────────────────────────────────────────
+def keep_alive():
+    import requests
+    time.sleep(30)  # wait for server to start first
+    while True:
+        try:
+            url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
+            requests.get(url + "/ping", timeout=10)
+            print(f"  [KeepAlive] Pinged {url}/ping")
+        except Exception as e:
+            print(f"  [KeepAlive] Failed: {e}")
+        time.sleep(600)  # ping every 10 minutes
 
 # ─────────────────────────────────────────────────────────────
 #  HOME SERVER FLASK APP
@@ -76,9 +76,6 @@ TOOLS = {
     "ai":     "http://localhost:7000",
 }
 
-# ─────────────────────────────────────────────────────────────
-#  HOME PAGE HTML
-# ─────────────────────────────────────────────────────────────
 HOME_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -106,8 +103,6 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
   background-size:60px 60px;opacity:.3}
 .grid-bg::after{content:'';position:absolute;inset:0;
   background:radial-gradient(ellipse 80% 60% at 50% 30%,transparent 40%,var(--bg) 100%)}
-
-/* NAV */
 nav{position:relative;z-index:100;display:flex;align-items:center;
     padding:0 24px;height:54px;background:rgba(8,13,24,.96);
     border-bottom:1px solid var(--border2);backdrop-filter:blur(12px);flex-shrink:0}
@@ -142,14 +137,10 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .nav-status{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--muted2);letter-spacing:.5px}
 .live-dot{width:6px;height:6px;border-radius:50%;background:var(--binlog);
           box-shadow:0 0 8px var(--binlog);animation:blink 1.4s infinite}
-
-/* CONTENT */
 .content{flex:1;overflow:hidden;position:relative}
 .view{display:none;width:100%;height:100%}
 .view.active{display:block}
 .tool-frame{width:100%;height:100%;border:none;display:block;background:var(--bg2)}
-
-/* HOME */
 .home-scroll{width:100%;height:100%;overflow-y:auto;position:relative;z-index:1}
 .home-scroll::-webkit-scrollbar{width:5px}
 .home-scroll::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
@@ -166,12 +157,9 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .hl-i{color:var(--fetch)!important;-webkit-text-stroke:0!important}
 .hl-a{color:var(--ai)!important;-webkit-text-stroke:0!important}
 .hero-sub{font-size:10px;color:var(--muted2);letter-spacing:.8px;max-width:440px;margin:0 auto 44px;line-height:1.9}
-
-/* STATUS PILLS */
 .tool-status-bar{display:flex;gap:10px;justify-content:center;padding:0 24px 24px;flex-wrap:wrap}
 .ts-pill{display:flex;align-items:center;gap:7px;padding:6px 14px;background:var(--surf);
-         border:1px solid var(--border2);border-radius:20px;font-size:9px;letter-spacing:.4px;cursor:pointer;
-         transition:all .15s}
+         border:1px solid var(--border2);border-radius:20px;font-size:9px;letter-spacing:.4px;cursor:pointer;transition:all .15s}
 .ts-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .ts-online .ts-dot{background:#22d87a;box-shadow:0 0 6px #22d87a;animation:blink 2s infinite}
 .ts-offline .ts-dot{background:#f43f5e}
@@ -179,9 +167,6 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .ts-online{border-color:#22d87a30;color:#22d87a}
 .ts-offline{border-color:#f43f5e30;color:#f43f5e}
 .ts-checking{border-color:#f59e0b30;color:var(--ai)}
-.ts-pill:hover{transform:translateY(-1px)}
-
-/* STATS */
 .stats-bar{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:44px;padding:0 24px}
 .stat-pill{display:flex;align-items:center;gap:12px;background:var(--surf);
            border:1px solid var(--border2);border-radius:8px;padding:10px 16px;min-width:140px}
@@ -189,8 +174,6 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .stat-info{display:flex;flex-direction:column;gap:2px}
 .stat-label{font-size:9px;color:var(--muted2);letter-spacing:.5px;text-transform:uppercase}
 .stat-sub{font-size:8px;color:var(--muted)}
-
-/* CARDS */
 .tools-grid{max-width:1040px;margin:0 auto;padding:0 24px 56px;
             display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
 .tool-card{background:var(--surf);border:1px solid var(--border2);border-radius:14px;
@@ -201,10 +184,8 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .tool-card:nth-child(2){animation-delay:.2s}
 .tool-card:nth-child(3){animation-delay:.3s}
 @keyframes cardIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
-.tool-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;
-                   border-radius:14px 14px 0 0;transition:height .2s}
-.tool-card::after{content:'';position:absolute;top:-40px;right:-40px;width:120px;height:120px;
-                  border-radius:50%;opacity:0;transition:opacity .3s}
+.tool-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:14px 14px 0 0;transition:height .2s}
+.tool-card::after{content:'';position:absolute;top:-40px;right:-40px;width:120px;height:120px;border-radius:50%;opacity:0;transition:opacity .3s}
 .card-binlog::before{background:linear-gradient(90deg,var(--binlog),#0ea5e9)}
 .card-fetch::before{background:linear-gradient(90deg,var(--fetch),#a855f7)}
 .card-ai::before{background:linear-gradient(90deg,var(--ai),#f97316)}
@@ -250,8 +231,6 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .card-binlog .card-open:hover{background:#22d87a18;border-color:var(--binlog)}
 .card-fetch  .card-open:hover{background:#6366f118;border-color:var(--fetch)}
 .card-ai     .card-open:hover{background:#f59e0b18;border-color:var(--ai)}
-
-/* OFFLINE OVERLAY */
 .offline-overlay{display:none;position:absolute;top:0;left:0;right:0;bottom:0;
                  background:var(--bg);z-index:10;flex-direction:column;
                  align-items:center;justify-content:center;gap:12px;
@@ -259,30 +238,22 @@ nav{position:relative;z-index:100;display:flex;align-items:center;
 .offline-overlay.show{display:flex}
 .retry-btn{margin-top:8px;padding:6px 16px;border-radius:6px;cursor:pointer;
            font-family:'Space Mono',monospace;font-size:10px;font-weight:700;border:1px solid}
-
 footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
        align-items:center;justify-content:space-between;font-size:9px;
        color:var(--muted);flex-wrap:wrap;gap:8px}
 .footer-logo{font-family:'Syne',sans-serif;font-weight:700;font-size:11px;color:var(--muted2);letter-spacing:2px}
-
 @media(max-width:650px){
-  nav{padding:0 10px}
-  .nav-logo{margin-right:10px;font-size:12px}
-  .nav-btn{padding:0 7px;font-size:9px}
-  .nav-badge,.nav-dot{display:none}
-  .hero{padding:40px 12px 28px}
-  .tools-grid,.stats-bar{padding:0 10px}
+  nav{padding:0 10px}.nav-logo{margin-right:10px;font-size:12px}
+  .nav-btn{padding:0 7px;font-size:9px}.nav-badge,.nav-dot{display:none}
+  .hero{padding:40px 12px 28px}.tools-grid,.stats-bar{padding:0 10px}
   .tools-grid{padding-bottom:40px}
 }
 </style>
 </head>
 <body>
 <div class="grid-bg"></div>
-
 <nav>
-  <div class="nav-logo">
-    <div class="nav-logo-icon">⚡</div>ADOPT
-  </div>
+  <div class="nav-logo"><div class="nav-logo-icon">⚡</div>ADOPT</div>
   <div class="nav-links">
     <button class="nav-btn btn-home active" id="nav-home" onclick="showView('home')">HOME</button>
     <button class="nav-btn btn-binlog" id="nav-binlog" onclick="showView('binlog')">
@@ -298,25 +269,17 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
   <div class="nav-spacer"></div>
   <div class="nav-status"><span class="live-dot"></span>SUITE v2</div>
 </nav>
-
 <div class="content">
-
-  <!-- HOME VIEW -->
   <div class="view active" id="view-home">
     <div class="home-scroll">
       <div class="hero">
         <div class="hero-glow"></div>
         <div class="hero-eyebrow"><span class="live-dot"></span>ADOPT INFRASTRUCTURE SUITE</div>
         <h1>Three Tools.<br>
-          <span class="line2">
-            One <span class="hl-g">Monitor</span>.
-            One <span class="hl-i">Reader</span>.
-            One <span class="hl-a">Brain</span>.
-          </span>
+          <span class="line2">One <span class="hl-g">Monitor</span>. One <span class="hl-i">Reader</span>. One <span class="hl-a">Brain</span>.</span>
         </h1>
         <p class="hero-sub">Real-time MySQL CDC &nbsp;·&nbsp; Historical binlog exploration &nbsp;·&nbsp; AI-powered database assistant</p>
       </div>
-
       <div class="tool-status-bar">
         <div class="ts-pill ts-checking" id="ts-binlog" onclick="showView('binlog')">
           <span class="ts-dot"></span>⚡ Live Monitor — checking...
@@ -328,7 +291,6 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
           <span class="ts-dot"></span>🤖 Database AI — checking...
         </div>
       </div>
-
       <div class="stats-bar">
         <div class="stat-pill">
           <div class="stat-val" style="color:var(--binlog)">10</div>
@@ -347,13 +309,12 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
           <div class="stat-info"><div class="stat-label">Version</div><div class="stat-sub">WhatsApp + Email</div></div>
         </div>
       </div>
-
       <div class="tools-grid">
         <div class="tool-card card-binlog" onclick="showView('binlog')">
           <div class="card-num">01</div>
           <div class="card-header"><div class="card-icon">📡</div><div class="card-tag">● LIVE</div></div>
           <div class="card-title">Live Binlog MySQL Monitoring</div>
-          <div class="card-desc">Real-time CDC from MySQL binary logs. Watch every INSERT, UPDATE, DELETE instantly — zero polling delay.</div>
+          <div class="card-desc">Real-time CDC from MySQL binary logs. Watch every INSERT, UPDATE, DELETE instantly.</div>
           <div class="card-features">
             <div class="card-feat">Real-time CDC via binlog stream</div>
             <div class="card-feat">Before / After diff for every UPDATE</div>
@@ -369,7 +330,7 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
           <div class="card-num">02</div>
           <div class="card-header"><div class="card-icon">📂</div><div class="card-tag">BROWSE</div></div>
           <div class="card-title">Binlog File Reader &amp; Download</div>
-          <div class="card-desc">Browse all historical binlog files. Click any file to stream, explore, and export its full change history.</div>
+          <div class="card-desc">Browse all historical binlog files. Stream, explore, and export full change history.</div>
           <div class="card-features">
             <div class="card-feat">Lists all binlog files with sizes</div>
             <div class="card-feat">Live streaming viewer per file</div>
@@ -385,7 +346,7 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
           <div class="card-num">03</div>
           <div class="card-header"><div class="card-icon">🤖</div><div class="card-tag">AI</div></div>
           <div class="card-title">Database + AI Assistant</div>
-          <div class="card-desc">Conversational AI explorer powered by Cohere. Ask in plain English or write raw SQL to query any database.</div>
+          <div class="card-desc">Conversational AI explorer. Ask in plain English or write raw SQL.</div>
           <div class="card-features">
             <div class="card-feat">Natural language to SQL</div>
             <div class="card-feat">Smart SQL autocomplete</div>
@@ -398,65 +359,59 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;
           </div>
         </div>
       </div>
-
       <footer>
         <span class="footer-logo">ADOPT · INFRASTRUCTURE SUITE</span>
-        <span>MySQL CDC · Cohere AI · Flask · Railway</span>
+        <span>MySQL CDC · Cohere AI · Flask · Render</span>
         <span>102.209.31.227</span>
       </footer>
     </div>
   </div>
 
-  <!-- TOOL IFRAMES -->
   <div class="view" id="view-binlog" style="position:relative">
     <div class="offline-overlay" id="off-binlog">
       <div style="font-size:36px">⚡</div>
-      <b style="color:var(--binlog)">Live Monitor starting up...</b>
-      <div style="font-size:11px;color:#4a5a75">Please wait a few seconds</div>
+      <b style="color:var(--binlog)">Live Monitor loading...</b>
+      <div style="font-size:11px;color:#4a5a75">Please wait</div>
       <button class="retry-btn" onclick="reloadFrame('binlog')"
         style="color:var(--binlog);border-color:#22d87a40;background:#22d87a0a">↺ Retry</button>
     </div>
     <iframe class="tool-frame" id="frame-binlog" src="about:blank"></iframe>
   </div>
-
   <div class="view" id="view-fetch" style="position:relative">
     <div class="offline-overlay" id="off-fetch">
       <div style="font-size:36px">📂</div>
-      <b style="color:var(--fetch)">File Reader starting up...</b>
-      <div style="font-size:11px;color:#4a5a75">Please wait a few seconds</div>
+      <b style="color:var(--fetch)">File Reader loading...</b>
+      <div style="font-size:11px;color:#4a5a75">Please wait</div>
       <button class="retry-btn" onclick="reloadFrame('fetch')"
         style="color:var(--fetch);border-color:#6366f140;background:#6366f10a">↺ Retry</button>
     </div>
     <iframe class="tool-frame" id="frame-fetch" src="about:blank"></iframe>
   </div>
-
   <div class="view" id="view-ai" style="position:relative">
     <div class="offline-overlay" id="off-ai">
       <div style="font-size:36px">🤖</div>
-      <b style="color:var(--ai)">Database AI starting up...</b>
-      <div style="font-size:11px;color:#4a5a75">Please wait a few seconds</div>
+      <b style="color:var(--ai)">Database AI loading...</b>
+      <div style="font-size:11px;color:#4a5a75">Please wait</div>
       <button class="retry-btn" onclick="reloadFrame('ai')"
         style="color:var(--ai);border-color:#f59e0b40;background:#f59e0b0a">↺ Retry</button>
     </div>
     <iframe class="tool-frame" id="frame-ai" src="about:blank"></iframe>
   </div>
-
 </div>
 
 <script>
-const loaded = {binlog:false,fetch:false,ai:false};
-const labels = {binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI'};
+const loaded={binlog:false,fetch:false,ai:false};
+const labels={binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI'};
 
 function showView(name){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('view-'+name).classList.add('active');
   document.getElementById('nav-'+name).classList.add('active');
-  if(name!=='home' && !loaded[name]) loadFrame(name);
+  if(name!=='home'&&!loaded[name]) loadFrame(name);
   const t={home:'ADOPT · Suite',binlog:'ADOPT · Live Monitor',fetch:'ADOPT · File Reader',ai:'ADOPT · Database AI'};
   document.title=t[name]||'ADOPT';
 }
-
 function loadFrame(name){
   const frame=document.getElementById('frame-'+name);
   const overlay=document.getElementById('off-'+name);
@@ -464,16 +419,11 @@ function loadFrame(name){
   frame.src='/tool/'+name+'/';
   loaded[name]=true;
   frame.onload=()=>{
-    try{ if(frame.contentDocument) overlay.classList.remove('show'); }
-    catch(e){ overlay.classList.remove('show'); }
+    try{if(frame.contentDocument) overlay.classList.remove('show');}
+    catch(e){overlay.classList.remove('show');}
   };
 }
-
-function reloadFrame(name){
-  loaded[name]=false;
-  loadFrame(name);
-}
-
+function reloadFrame(name){loaded[name]=false;loadFrame(name);}
 async function checkStatus(){
   try{
     const res=await fetch('/api/status');
@@ -481,7 +431,6 @@ async function checkStatus(){
     for(const [name,info] of Object.entries(data)){
       const el=document.getElementById('ts-'+name);
       if(!el) continue;
-      const dot=el.querySelector('.ts-dot');
       el.className='ts-pill '+(info.online?'ts-online':'ts-offline');
       el.innerHTML=`<span class="ts-dot"></span>${labels[name]} — ${info.online?'Online ✓':'Starting...'}`;
     }
@@ -502,6 +451,10 @@ setInterval(checkStatus,5000);
 def home():
     return Response(HOME_HTML, mimetype="text/html")
 
+@home_app.route("/ping")
+def ping():
+    """Keep-alive endpoint"""
+    return Response("pong", mimetype="text/plain")
 
 @home_app.route("/api/status")
 def api_status():
@@ -529,10 +482,14 @@ def proxy_request(tool_name, path):
         headers = {k: v for k, v in request.headers
                    if k.lower() not in ("host", "content-length")}
         resp = req.request(
-            method=request.method, url=target_url,
-            headers=headers, data=request.get_data(),
-            cookies=request.cookies, allow_redirects=False,
-            timeout=30, stream=True,
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            allow_redirects=False,
+            timeout=30,
+            stream=True,
         )
         excluded = ["content-encoding", "content-length",
                     "transfer-encoding", "connection"]
@@ -543,21 +500,53 @@ def proxy_request(tool_name, path):
         if "text/html" in content_type:
             content = resp.content.decode("utf-8", errors="replace")
             prefix = f"/tool/{tool_name}"
-            # Rewrite absolute paths
+
+            # Fix absolute paths in HTML attributes
             for pat in ['src="/', "src='/", 'href="/', "href='/", 'action="/']:
                 q = pat[4]
                 content = content.replace(pat, f"{pat[:4]}{q}{prefix}/")
-            # Rewrite JS API calls
-            for api in ["/api/", "/viewer/", "/api/start/",
-                        "/api/status/", "/api/binlogs"]:
+
+            # Fix ALL JS fetch() calls — both single and double quotes
+            api_paths = [
+                "/api/events", "/api/stats", "/api/counts",
+                "/api/table_stats", "/api/export/csv",
+                "/api/event/", "/api/chat", "/api/execute",
+                "/api/schema", "/api/schema_full", "/api/table_columns",
+                "/api/table_data", "/api/ai_status",
+                "/api/binlogs", "/api/start/", "/api/status/",
+                "/viewer/",
+            ]
+            for api in api_paths:
                 content = content.replace(f"fetch('{api}", f"fetch('{prefix}{api}")
                 content = content.replace(f'fetch("{api}', f'fetch("{prefix}{api}')
+                # Also fix template literals
+                content = content.replace(f"fetch(`{api}", f"fetch(`{prefix}{api}")
+                # Fix window.open and location
+                content = content.replace(f"window.open('{api}", f"window.open('{prefix}{api}")
+                content = content.replace(f'window.open("{api}', f'window.open("{prefix}{api}')
+
+            # Fix dynamic fetch with string concatenation like fetch(`/api/event/${id}`)
+            import re
+            content = re.sub(
+                r"fetch\(`/api/",
+                f"fetch(`{prefix}/api/",
+                content
+            )
+            content = re.sub(
+                r"fetch\(`/viewer/",
+                f"fetch(`{prefix}/viewer/",
+                content
+            )
+
             return Response(content, status=resp.status_code,
                             headers=resp_headers, content_type=content_type)
 
-        return Response(resp.iter_content(chunk_size=8192),
-                        status=resp.status_code, headers=resp_headers,
-                        content_type=content_type)
+        return Response(
+            resp.iter_content(chunk_size=8192),
+            status=resp.status_code,
+            headers=resp_headers,
+            content_type=content_type,
+        )
 
     except req.exceptions.ConnectionError:
         return Response(
@@ -593,7 +582,7 @@ def proxy_ai(path): return proxy_request("ai", path)
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  ADOPT Infrastructure Suite — Master Server")
+    print("  ADOPT Infrastructure Suite — Master Server (Fixed)")
     print("=" * 60)
 
     print("\n  Starting all 3 tools in background threads...\n")
@@ -609,6 +598,11 @@ if __name__ == "__main__":
     t3 = threading.Thread(target=start_tool_3, daemon=True)
     t3.start()
     time.sleep(2)
+
+    # Start keep-alive thread
+    ka = threading.Thread(target=keep_alive, daemon=True)
+    ka.start()
+    print("  [KeepAlive] Started — pinging every 10 min to prevent sleep")
 
     print(f"\n  ✅  All tools started!")
     print(f"  🌐  Open browser: http://localhost:{PORT}")
