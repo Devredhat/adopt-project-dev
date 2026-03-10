@@ -666,7 +666,7 @@ footer {
 <script>
 async function loadFiles() {
   try {
-    const res  = await fetch('/api/binlogs');
+    const res  = await fetch('/tool/fetch/api/binlogs');
     const data = await res.json();
     const grid = document.getElementById('file-grid');
 
@@ -681,7 +681,7 @@ async function loadFiles() {
     }
 
     grid.innerHTML = data.files.map((f, i) => `
-      <a class="file-card" href="/viewer/${encodeURIComponent(f.name)}" target="_blank" rel="noopener">
+      <a class="file-card" href="/tool/fetch/viewer/${encodeURIComponent(f.name)}" target="_blank" rel="noopener">
         <div class="file-icon">📂</div>
         <div class="file-info">
           <div class="file-name">${f.name}</div>
@@ -919,7 +919,7 @@ const dateSet  = new Set();
 // ── Start ────────────────────────────────────────────────────
 async function startJob() {
   try {
-    const r = await fetch(`/api/start/${encodeURIComponent(FNAME)}`);
+    const r = await fetch(`/tool/fetch/api/start/${encodeURIComponent(FNAME)}`);
     const d = await r.json();
     if (d.error) { showError(d.error); return; }
     startPolling();
@@ -933,7 +933,7 @@ function startPolling() {
 
 async function poll() {
   try {
-    const r = await fetch(`/api/status/${encodeURIComponent(FNAME)}?offset=${offset}`);
+    const r = await fetch(`/tool/fetch/api/status/${encodeURIComponent(FNAME)}?offset=${offset}`);
     const d = await r.json();
     if (d.error) { clearInterval(polling); showError(d.error); return; }
 
@@ -1304,4 +1304,5 @@ if __name__ == "__main__":
     startup()
     print(f"\n  ✅  Open in browser: http://localhost:{PORT}")
     print(f"  ⚡  Press Ctrl+C to stop\n")
+
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
