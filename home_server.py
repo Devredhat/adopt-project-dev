@@ -82,7 +82,7 @@ HOME_HTML = """<!DOCTYPE html>
 <style>
 :root{--bg:#05080f;--bg2:#080d18;--surf:#0c1220;--border:#182035;--border2:#1e2d45;
       --text:#8ba3c4;--bright:#dce8f8;--muted:#2d3f58;--muted2:#3d5570;
-      --binlog:#22d87a;--fetch:#6366f1;--ai:#f59e0b}
+      --binlog:#22d87a;--fetch:#6366f1;--ai:#f59e0b;--users:#00e676}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden}
 body{background:var(--bg);color:var(--text);font-family:'Space Mono',monospace;height:100vh;display:flex;flex-direction:column}
@@ -219,6 +219,9 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
   .nav-btn{padding:0 7px;font-size:9px}.nav-badge,.nav-dot{display:none}
   .hero{padding:40px 12px 28px}.tools-grid,.stats-bar{padding:0 10px}.tools-grid{padding-bottom:40px}
 }
+.btn-users::after{background:var(--users)}.btn-users.active{color:var(--users);border-bottom-color:var(--users)}
+.btn-users .nav-dot{background:var(--users)}
+.btn-users .nav-badge{background:#00e67615;color:var(--users);border:1px solid #00e67630}
 </style>
 </head>
 <body>
@@ -235,6 +238,9 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
     </button>
     <button class="nav-btn btn-ai" id="nav-ai" onclick="showView('ai')">
       <span class="nav-dot"></span>DATABASE AI<span class="nav-badge">AI</span>
+    </button>
+    <button class="nav-btn btn-users" id="nav-users" onclick="showView('users')">
+      <span class="nav-dot"></span>USER ACTIVITY<span class="nav-badge">NEW</span>
     </button>
   </div>
   <div class="nav-spacer"></div>
@@ -305,6 +311,20 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
           <div class="card-footer"><div class="card-port">Port: <b>7000</b></div>
             <button class="card-open" onclick="event.stopPropagation();showView('ai')">Open →</button></div>
         </div>
+        <div class="tool-card card-binlog" onclick="showView('users')" style="--binlog:#00e676">
+          <div class="card-num">04</div>
+          <div class="card-header"><div class="card-icon">👤</div><div class="card-tag" style="background:#00e67612;color:#00e676;border:1px solid #00e67630">● NEW</div></div>
+          <div class="card-title">User Activity Dashboard</div>
+          <div class="card-desc">Track staff login history, module usage, and audit trail across all 125 staff users.</div>
+          <div class="card-features">
+            <div class="card-feat">938K+ audit events</div>
+            <div class="card-feat">Per-user activity history</div>
+            <div class="card-feat">Module & operation breakdown</div>
+            <div class="card-feat">Live activity feed</div>
+          </div>
+          <div class="card-footer"><div class="card-port">Port: <b style="color:#00e676">6000</b></div>
+            <button class="card-open" style="color:#00e676;border-color:#00e67640;background:#00e67608" onclick="event.stopPropagation();showView('users')">Open →</button></div>
+        </div>
       </div>
       <footer>
         <span class="footer-logo">ADOPT · INFRASTRUCTURE SUITE</span>
@@ -337,17 +357,25 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
     </div>
     <iframe class="tool-frame" id="frame-ai" src="about:blank"></iframe>
   </div>
+  <div class="view" id="view-users" style="position:relative">
+    <div class="offline-overlay" id="off-users">
+      <div style="font-size:36px">👤</div><b style="color:#00e676">User Activity loading...</b>
+      <div style="font-size:11px;color:#4a5a75">Please wait</div>
+      <button class="retry-btn" onclick="reloadFrame('users')" style="color:#00e676;border-color:#00e67640;background:#00e6760a">↺ Retry</button>
+    </div>
+    <iframe class="tool-frame" id="frame-users" src="about:blank"></iframe>
+  </div>
 </div>
 <script>
-const loaded={binlog:false,fetch:false,ai:false};
-const labels={binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI'};
+const loaded={binlog:false,fetch:false,ai:false,users:false};
+const labels={binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI',users:'👤 User Activity'};
 function showView(name){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('view-'+name).classList.add('active');
   document.getElementById('nav-'+name).classList.add('active');
   if(name!=='home'&&!loaded[name]) loadFrame(name);
-  const t={home:'ADOPT · Suite',binlog:'ADOPT · Live Monitor',fetch:'ADOPT · File Reader',ai:'ADOPT · Database AI'};
+  const t={home:'ADOPT · Suite',binlog:'ADOPT · Live Monitor',fetch:'ADOPT · File Reader',ai:'ADOPT · Database AI',users:'ADOPT · User Activity'};
   document.title=t[name]||'ADOPT';
 }
 function loadFrame(name){
