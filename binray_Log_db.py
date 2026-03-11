@@ -41,7 +41,7 @@ app = Flask(__name__)
 EMAIL_CONFIG = {
     "enabled":         True,
     "smtp_server":     "smtp.gmail.com",
-    "smtp_port":       465,
+    "smtp_port":       587,
     "sender_email":    "mbsuthar32@gmail.com",
     "sender_password": "dryfbgqdixyuqprf",
     "recipient_email": "mbsuthar32@gmail.com",
@@ -166,38 +166,6 @@ def uptime_str():
         return f"{h}h {m}m {s}s"
     except:
         return "—"
-
-# ── DAILY RESET ──────────────────────────────────────────────
-def reset_daily_state():
-    """Har raat 12 baje state reset karo"""
-    while True:
-        now = datetime.now()
-        # Agle 12 baje tak kitna time bacha
-        from datetime import timedelta
-        tomorrow_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        wait_seconds = (tomorrow_midnight - now).total_seconds()
-        time.sleep(wait_seconds)
-        
-        # Reset karo!
-        global _event_id
-        STATE["events"].clear()
-        STATE["last_event"] = None
-        STATE["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        STATE["stats"] = {
-            "total_inserts": 0,
-            "total_updates": 0,
-            "total_deletes": 0,
-            "total_soft_deletes": 0,
-            "total_restores": 0,
-            "whatsapp_sent": 0,
-            "whatsapp_failed": 0,
-            "per_table": {},
-        }
-        STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
-        _event_id = 0
-        print(f"  🔄  Daily reset done! New day started: {datetime.now().strftime('%Y-%m-%d')}")
 
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP via CallMeBot (FREE)
@@ -428,9 +396,10 @@ tr:nth-child(even) td{{background:#fafafa}}
 </div></body></html>"""
 
         msg.attach(MIMEText(html, "html"))
-       with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
-            srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
-            srv.send_message(msg)
+      with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
+        srv.starttls()
+        srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
+        srv.send_message(msg)
         print(f"  ✉  Email sent [{event_type}] -> {db}.{table}")
 
     except Exception as e:
@@ -1289,7 +1258,5 @@ if __name__ == "__main__":
     check_binlog_status()
     warm_column_cache()
     threading.Thread(target=binlog_monitor, daemon=True).start()
-    threading.Thread(target=reset_daily_state, daemon=True).start()
     print("\nDashboard: http://0.0.0.0:5000\n")
 
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
