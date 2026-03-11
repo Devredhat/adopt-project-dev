@@ -33,18 +33,14 @@ def get_conn():
 
 @app.route("/api/stats")
 def api_stats():
-    """Overall stats — total users, today's activity, most active user"""
     try:
         conn = get_conn()
         cur  = conn.cursor()
-
         today = datetime.now().strftime("%Y-%m-%d")
 
-        # Total staff
         cur.execute("SELECT COUNT(*) as cnt FROM adoptconvergebss.tblstaffuser WHERE is_delete=0")
         total_staff = cur.fetchone()["cnt"]
 
-        # Active staff (logged in last 7 days via audit)
         cur.execute("""
             SELECT COUNT(DISTINCT user_id) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -52,7 +48,6 @@ def api_stats():
         """)
         active_7d = cur.fetchone()["cnt"]
 
-        # Today's events
         cur.execute("""
             SELECT COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -60,7 +55,6 @@ def api_stats():
         """, (today,))
         today_events = cur.fetchone()["cnt"]
 
-        # Most active user today
         cur.execute("""
             SELECT user_name, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -69,7 +63,6 @@ def api_stats():
         """, (today,))
         top_user = cur.fetchone()
 
-        # Module breakdown today
         cur.execute("""
             SELECT module, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -78,7 +71,6 @@ def api_stats():
         """, (today,))
         modules = cur.fetchall()
 
-        # Operations breakdown today
         cur.execute("""
             SELECT operation, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -87,7 +79,6 @@ def api_stats():
         """, (today,))
         operations = cur.fetchall()
 
-        # Hourly activity today — fixed
         cur.execute("""
             SELECT HOUR(auditdate) as hr, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
@@ -113,7 +104,6 @@ def api_stats():
 
 @app.route("/api/users")
 def api_users():
-    """List all staff users with their last activity"""
     search = freq.args.get("search", "").strip()
     status = freq.args.get("status", "").strip()
     try:
@@ -129,7 +119,6 @@ def api_users():
             where += " AND s.sstatus = %s"
             params.append(status)
 
-        # Fast version — no correlated subqueries
         cur.execute(f"""
             SELECT
                 s.staffid, s.firstname, s.lastname, s.username,
@@ -171,7 +160,6 @@ def api_users():
 
 @app.route("/api/user/<int:uid>/activity")
 def api_user_activity(uid):
-    """Get activity history for a specific user"""
     date_from = freq.args.get("from", (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"))
     date_to   = freq.args.get("to",   datetime.now().strftime("%Y-%m-%d"))
     limit     = int(freq.args.get("limit", 100))
@@ -182,8 +170,43 @@ def api_user_activity(uid):
         conn = get_conn()
         cur  = conn.cursor()
 
+        # ── Get staff info first ──────────────────────────────
+        cur.execute("""
+            SELECT staffid, firstname, lastname, username, email,
+                   phone, sstatus, last_login_time, department, createdate
+            FROM adoptconvergebss.tblstaffuser
+            WHERE staffid = %s
+        """, [uid])
+        user_info = cur.fetchone()
+
+        # ── Find correct audit user_id by matching full name ──
+        # tblauditlog.user_id may differ from tblstaffuser.staffid
+        # Match by CONCAT(firstname, ' ', lastname) = user_name in audit
+        audit_uid = uid  # fallback
+        if user_info:
+            full_name = f"{user_info['firstname']} {user_info['lastname']}".strip()
+            cur.execute("""
+                SELECT DISTINCT user_id FROM adoptconvergebss.tblauditlog
+                WHERE user_name = %s
+                ORDER BY user_id LIMIT 1
+            """, [full_name])
+            row = cur.fetchone()
+            if row:
+                audit_uid = row["user_id"]
+            else:
+                # fallback: try employee_name match
+                cur.execute("""
+                    SELECT DISTINCT user_id FROM adoptconvergebss.tblauditlog
+                    WHERE employee_name = %s
+                    ORDER BY user_id LIMIT 1
+                """, [full_name])
+                row2 = cur.fetchone()
+                if row2:
+                    audit_uid = row2["user_id"]
+
+        # ── Build where clause using resolved audit_uid ───────
         where = "WHERE user_id = %s AND DATE(auditdate) BETWEEN %s AND %s"
-        params = [uid, date_from, date_to]
+        params = [audit_uid, date_from, date_to]
         if module_f:
             where += " AND module = %s"
             params.append(module_f)
@@ -192,9 +215,11 @@ def api_user_activity(uid):
         cur.execute(f"SELECT COUNT(*) as cnt FROM adoptconvergebss.tblauditlog {where}", params)
         total = cur.fetchone()["cnt"]
 
-        # Events
+        # Events — with full datetime
         cur.execute(f"""
-            SELECT audit_id, auditdate, user_name, module, operation,
+            SELECT audit_id,
+                   DATE_FORMAT(auditdate, '%Y-%m-%d %H:%i:%s') as auditdate,
+                   user_name, module, operation,
                    ip_address, remark, entity_ref_id
             FROM adoptconvergebss.tblauditlog
             {where}
@@ -203,13 +228,13 @@ def api_user_activity(uid):
         """, params + [limit, offset])
         events = cur.fetchall()
 
-        # Module breakdown for this user in range
+        # Module breakdown
         cur.execute("""
             SELECT module, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
             WHERE user_id = %s AND DATE(auditdate) BETWEEN %s AND %s
             GROUP BY module ORDER BY cnt DESC
-        """, [uid, date_from, date_to])
+        """, [audit_uid, date_from, date_to])
         modules = cur.fetchall()
 
         # Operation breakdown
@@ -218,17 +243,8 @@ def api_user_activity(uid):
             FROM adoptconvergebss.tblauditlog
             WHERE user_id = %s AND DATE(auditdate) BETWEEN %s AND %s
             GROUP BY operation ORDER BY cnt DESC
-        """, [uid, date_from, date_to])
+        """, [audit_uid, date_from, date_to])
         operations = cur.fetchall()
-
-        # User info
-        cur.execute("""
-            SELECT staffid, firstname, lastname, username, email,
-                   phone, sstatus, last_login_time, department, createdate
-            FROM adoptconvergebss.tblstaffuser
-            WHERE staffid = %s
-        """, [uid])
-        user_info = cur.fetchone()
 
         cur.close(); conn.close()
         return jsonify({
@@ -239,6 +255,7 @@ def api_user_activity(uid):
             "operations": operations,
             "date_from": date_from,
             "date_to": date_to,
+            "audit_uid": audit_uid,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -246,12 +263,13 @@ def api_user_activity(uid):
 
 @app.route("/api/live_feed")
 def api_live_feed():
-    """Latest 50 audit events across all users"""
     try:
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute("""
-            SELECT audit_id, auditdate, user_name, user_id,
+            SELECT audit_id,
+                   DATE_FORMAT(auditdate, '%Y-%m-%d %H:%i:%s') as auditdate,
+                   user_name, user_id,
                    module, operation, ip_address, remark
             FROM adoptconvergebss.tblauditlog
             ORDER BY auditdate DESC, audit_id DESC
@@ -266,7 +284,6 @@ def api_live_feed():
 
 @app.route("/api/modules")
 def api_modules():
-    """Distinct modules for filter dropdown"""
     try:
         conn = get_conn()
         cur  = conn.cursor()
@@ -276,6 +293,40 @@ def api_modules():
         return jsonify(mods)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── NEW: lookup staffid by audit user_id (for live feed clicks) ──
+@app.route("/api/staffid_by_audit_uid/<int:audit_uid>")
+def staffid_by_audit_uid(audit_uid):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        # Get user_name from audit log
+        cur.execute("""
+            SELECT DISTINCT user_name FROM adoptconvergebss.tblauditlog
+            WHERE user_id = %s LIMIT 1
+        """, [audit_uid])
+        row = cur.fetchone()
+        if not row:
+            cur.close(); conn.close()
+            return jsonify({"staffid": audit_uid})
+
+        user_name = row["user_name"]
+        parts = user_name.strip().split(" ", 1)
+        firstname = parts[0] if parts else ""
+        lastname  = parts[1] if len(parts) > 1 else ""
+
+        cur.execute("""
+            SELECT staffid FROM adoptconvergebss.tblstaffuser
+            WHERE firstname = %s AND lastname = %s AND is_delete = 0
+            LIMIT 1
+        """, [firstname, lastname])
+        staff = cur.fetchone()
+        cur.close(); conn.close()
+
+        return jsonify({"staffid": staff["staffid"] if staff else audit_uid, "user_name": user_name})
+    except Exception as e:
+        return jsonify({"staffid": audit_uid, "error": str(e)})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -295,7 +346,6 @@ HTML = r"""<!DOCTYPE html>
   --text:#7a9ab8;--bright:#d4e8f8;--muted:#2a3d52;--muted2:#3a5068;
   --green:#00e676;--blue:#38bdf8;--orange:#fb923c;--red:#f43f5e;
   --purple:#a78bfa;--yellow:#fbbf24;
-  --acc:#00e676;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;min-height:100vh}
@@ -395,7 +445,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
 .feed-row{display:flex;gap:10px;padding:8px 16px;border-bottom:1px solid var(--border);
   font-size:10px;align-items:flex-start;cursor:pointer;transition:background .1s}
 .feed-row:hover{background:var(--surf2)}
-.feed-time{color:var(--muted2);white-space:nowrap;font-size:9px;margin-top:1px;min-width:120px}
+.feed-time{color:var(--muted2);white-space:nowrap;font-size:9px;margin-top:1px;min-width:135px}
 .feed-user{color:var(--bright);font-weight:600;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;min-width:120px;max-width:140px}
 .feed-detail{color:var(--text);flex:1;min-width:0}
@@ -421,6 +471,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
 .spin{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--green);
   border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* detail info box */
+.detail-box{background:var(--surf3);border:1px solid var(--border2);border-radius:8px;
+  padding:10px 14px;font-size:9px;color:var(--muted2);margin-top:6px}
+.detail-box span{color:var(--bright)}
 </style>
 </head>
 <body>
@@ -446,9 +500,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
       <div class="sb-title">Staff Users</div>
       <input class="sb-search" id="user-search" placeholder="🔍 Search name, username..." oninput="filterUsers()">
       <div class="sb-filters">
-        <button class="sf active" onclick="setStatusFilter('')">All</button>
-        <button class="sf" onclick="setStatusFilter('ACTIVE')">Active</button>
-        <button class="sf" onclick="setStatusFilter('INACTIVE')">Inactive</button>
+        <button class="sf active" onclick="setStatusFilter(event,'')">All</button>
+        <button class="sf" onclick="setStatusFilter(event,'ACTIVE')">Active</button>
+        <button class="sf" onclick="setStatusFilter(event,'INACTIVE')">Inactive</button>
       </div>
     </div>
     <div class="sb-list" id="user-list">
@@ -457,6 +511,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
   </div>
 
   <div class="main">
+    <!-- HOME VIEW -->
     <div id="view-home" class="main-inner home-view">
       <div class="stats-row" id="stats-row">
         <div class="loading"><div class="spin"></div></div>
@@ -492,6 +547,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
       </div>
     </div>
 
+    <!-- USER DETAIL VIEW -->
     <div id="view-user" style="display:none">
       <div id="user-detail-head"></div>
       <div class="main-inner" style="padding-top:16px">
@@ -534,7 +590,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 2
             <table class="act-table">
               <thead>
                 <tr>
-                  <th>Time</th><th>Module</th><th>Operation</th><th>Details</th>
+                  <th>Date &amp; Time</th>
+                  <th>Module</th>
+                  <th>Operation</th>
+                  <th>Details</th>
                 </tr>
               </thead>
               <tbody id="act-tbody"></tbody>
@@ -557,8 +616,14 @@ const actLimit = 100;
 let actTotal = 0;
 
 const COLORS = ['#00e676','#38bdf8','#fb923c','#a78bfa','#fbbf24','#f43f5e','#34d399','#818cf8'];
-function avatarColor(id){ return COLORS[id % COLORS.length]; }
+function avatarColor(id){ return COLORS[Math.abs(id) % COLORS.length]; }
 function initials(fn, ln){ return ((fn||'?')[0]+(ln||'?')[0]).toUpperCase(); }
+
+function fmtTime(v){
+  // handles both "2026-03-11 12:34:56" and "2026-03-11T12:34:56" and Date objects
+  if(!v) return '—';
+  return String(v).replace('T',' ').slice(0,19);
+}
 
 function opClass(op){
   if(!op) return 'op-default';
@@ -567,11 +632,11 @@ function opClass(op){
   if(o.includes('add')||o.includes('creat')||o.includes('insert')) return 'op-add';
   if(o.includes('update')||o.includes('edit')||o.includes('modif')) return 'op-update';
   if(o.includes('delet')||o.includes('remov')) return 'op-delete';
-  if(o.includes('login')) return 'op-login';
-  if(o.includes('logout')) return 'op-login';
+  if(o.includes('login')||o.includes('logout')) return 'op-login';
   return 'op-default';
 }
 
+// ── Stats ──────────────────────────────────────────────────
 async function loadStats(){
   try{
     const s = await fetch('/api/stats').then(r=>r.json());
@@ -596,9 +661,10 @@ async function loadStats(){
       </div>
       <div class="stat-card">
         <div class="stat-label">Most Active Today</div>
-        <div class="stat-val" style="color:var(--orange);font-size:14px;margin-top:4px">${s.top_user ? s.top_user.user_name : '—'}</div>
-        <div class="stat-sub">${s.top_user ? s.top_user.cnt+' actions' : ''}</div>
+        <div class="stat-val" style="color:var(--orange);font-size:13px;margin-top:4px">${s.top_user?s.top_user.user_name:'—'}</div>
+        <div class="stat-sub">${s.top_user?s.top_user.cnt+' actions':''}</div>
       </div>`;
+
     const maxH = Math.max(...Object.values(s.hourly||{}), 1);
     let hhtml = '<div class="hour-chart">';
     for(let i=0;i<24;i++){
@@ -611,23 +677,27 @@ async function loadStats(){
     }
     hhtml += '</div>';
     document.getElementById('hour-chart-wrap').innerHTML = hhtml;
+
     const maxM = Math.max(...(s.modules||[]).map(m=>m.cnt), 1);
     document.getElementById('module-bars').innerHTML =
-      (s.modules||[]).map((m,i) => `
+      (s.modules||[]).map((m,i)=>`
         <div class="mod-bar-row">
           <div class="mod-bar-name">${m.module||'Unknown'}</div>
           <div class="mod-bar-wrap"><div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div></div>
           <div class="mod-bar-cnt">${m.cnt}</div>
-        </div>`).join('') || '<div class="empty">No data</div>';
+        </div>`).join('')||'<div class="empty">No data</div>';
+
     document.getElementById('ops-grid').innerHTML =
-      (s.operations||[]).map(o => `
+      (s.operations||[]).map(o=>`
         <div class="ops-item">
           <span class="op-badge ${opClass(o.operation)}">${o.operation||'Unknown'}</span>
           <span style="color:var(--bright);font-weight:600">${o.cnt}</span>
-        </div>`).join('') || '<div class="empty">No data</div>';
+        </div>`).join('')||'<div class="empty">No data</div>';
+
   } catch(e){ console.error(e); }
 }
 
+// ── Users ──────────────────────────────────────────────────
 async function loadUsers(){
   try{
     const resp = await fetch('/api/users').then(r=>r.json());
@@ -650,10 +720,10 @@ function filterUsers(){
   renderUserList();
 }
 
-function setStatusFilter(s){
+function setStatusFilter(ev, s){
   statusFilter = s;
   document.querySelectorAll('.sf').forEach(b=>b.classList.remove('active'));
-  event.target.classList.add('active');
+  ev.target.classList.add('active');
   filterUsers();
 }
 
@@ -683,6 +753,7 @@ function renderUserList(){
   }).join('');
 }
 
+// ── Live Feed ──────────────────────────────────────────────
 async function loadLiveFeed(){
   try{
     const resp = await fetch('/api/live_feed').then(r=>r.json());
@@ -692,51 +763,74 @@ async function loadLiveFeed(){
       return;
     }
     el.innerHTML = resp.events.map(e => `
-      <div class="feed-row" onclick="openUser(${e.user_id})">
-        <div class="feed-time">${(e.auditdate||'').replace('T',' ').slice(0,16)}</div>
+      <div class="feed-row" onclick="openUserByAuditUid(${e.user_id})">
+        <div class="feed-time">${fmtTime(e.auditdate)}</div>
         <div class="feed-user">${e.user_name||'—'}</div>
         <div class="feed-detail">
           <span class="mod-tag">${e.module||'—'}</span>
           <span class="op-badge ${opClass(e.operation)}" style="margin-left:5px">${e.operation||'—'}</span>
-          <span style="color:var(--muted2);margin-left:6px;font-size:9px">${(e.remark||'').slice(0,60)}</span>
+          <span style="color:var(--muted2);margin-left:6px;font-size:9px">${(e.remark||'').slice(0,70)}</span>
         </div>
       </div>`).join('');
   } catch(e){ console.error(e); }
 }
 
+// ── Open user from live feed (audit_uid → staffid) ─────────
+async function openUserByAuditUid(audit_uid){
+  try{
+    const r = await fetch(`/api/staffid_by_audit_uid/${audit_uid}`).then(r=>r.json());
+    openUser(r.staffid);
+  } catch(e){
+    openUser(audit_uid);
+  }
+}
+
+// ── User Detail ────────────────────────────────────────────
 async function openUser(uid){
   activeUserId = uid;
   renderUserList();
   document.getElementById('view-home').style.display = 'none';
   document.getElementById('view-user').style.display = 'block';
+
   const today = new Date().toISOString().split('T')[0];
   const week  = new Date(Date.now()-7*86400000).toISOString().split('T')[0];
   document.getElementById('date-from').value = week;
   document.getElementById('date-to').value   = today;
+
   try{
     const mods = await fetch('/api/modules').then(r=>r.json());
     const sel = document.getElementById('mod-filter');
     sel.innerHTML = '<option value="">All Modules</option>' +
       mods.map(m=>`<option value="${m}">${m}</option>`).join('');
   } catch(e){}
+
   actOffset = 0;
   await loadUserActivity();
 }
 
 async function loadUserActivity(){
-  const uid = activeUserId;
+  const uid  = activeUserId;
   const from = document.getElementById('date-from').value;
   const to   = document.getElementById('date-to').value;
   const mod  = document.getElementById('mod-filter').value;
+
+  // Show loading in table
+  document.getElementById('act-tbody').innerHTML =
+    `<tr><td colspan="4"><div class="loading"><div class="spin"></div>Loading...</div></td></tr>`;
+
   try{
     const resp = await fetch(
       `/api/user/${uid}/activity?from=${from}&to=${to}&module=${encodeURIComponent(mod)}&limit=${actLimit}&offset=${actOffset}`
     ).then(r=>r.json());
+
     if(resp.error){ console.error(resp.error); return; }
     actTotal = resp.total;
+
     const u = resp.user || {};
     const color = avatarColor(u.staffid||0);
-    const name = `${u.firstname||''} ${u.lastname||''}`.trim();
+    const name  = `${u.firstname||''} ${u.lastname||''}`.trim();
+
+    // Header
     document.getElementById('user-detail-head').innerHTML = `
       <div class="user-detail-head">
         <div class="udh-avatar" style="background:${color}20;color:${color};border:1px solid ${color}40">
@@ -749,7 +843,11 @@ async function loadUserActivity(){
             <span class="udh-tag" style="color:${u.sstatus==='ACTIVE'?'var(--green)':'var(--red)'};border-color:${u.sstatus==='ACTIVE'?'#00e67640':'#f43f5e40'}">${u.sstatus||'—'}</span>
             ${u.department?`<span class="udh-tag" style="color:var(--blue);border-color:#38bdf840">${u.department}</span>`:''}
             ${u.phone?`<span class="udh-tag" style="color:var(--muted2);border-color:var(--border2)">📞 ${u.phone}</span>`:''}
-            ${u.last_login_time?`<span class="udh-tag" style="color:var(--yellow);border-color:#fbbf2440">Last Login: ${u.last_login_time}</span>`:''}
+            ${u.last_login_time?`<span class="udh-tag" style="color:var(--yellow);border-color:#fbbf2440">Last Login: ${fmtTime(u.last_login_time)}</span>`:''}
+          </div>
+          <div class="detail-box" style="margin-top:8px">
+            DB: <span>adoptconvergebss</span> · Table: <span>tblauditlog</span> ·
+            Audit UID: <span>${resp.audit_uid}</span> · Staff ID: <span>${u.staffid||'—'}</span>
           </div>
         </div>
         <div>
@@ -760,6 +858,8 @@ async function loadUserActivity(){
           </div>
         </div>
       </div>`;
+
+    // Mini stats
     document.getElementById('user-stats-row').innerHTML = `
       <div class="stat-card">
         <div class="stat-label">Total in Range</div>
@@ -772,36 +872,51 @@ async function loadUserActivity(){
       <div class="stat-card">
         <div class="stat-label">Operation Types</div>
         <div class="stat-val" style="color:var(--orange)">${resp.operations.length}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Date Range</div>
+        <div class="stat-val" style="color:var(--text);font-size:11px;margin-top:4px">${from}</div>
+        <div class="stat-sub">→ ${to}</div>
       </div>`;
+
+    // Module bars
     const maxM = Math.max(...(resp.modules||[]).map(m=>m.cnt),1);
     document.getElementById('user-module-bars').innerHTML =
-      (resp.modules||[]).map((m,i) => `
+      (resp.modules||[]).map((m,i)=>`
         <div class="mod-bar-row">
-          <div class="mod-bar-name">${m.module}</div>
+          <div class="mod-bar-name">${m.module||'—'}</div>
           <div class="mod-bar-wrap"><div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div></div>
           <div class="mod-bar-cnt">${m.cnt}</div>
-        </div>`).join('') || '<div class="empty">No data</div>';
+        </div>`).join('')||'<div class="empty">No data</div>';
+
+    // Ops
     document.getElementById('user-ops-grid').innerHTML =
-      (resp.operations||[]).map(o => `
+      (resp.operations||[]).map(o=>`
         <div class="ops-item">
-          <span class="op-badge ${opClass(o.operation)}">${o.operation}</span>
+          <span class="op-badge ${opClass(o.operation)}">${o.operation||'—'}</span>
           <span style="color:var(--bright);font-weight:600">${o.cnt}</span>
-        </div>`).join('') || '<div class="empty">No data</div>';
+        </div>`).join('')||'<div class="empty">No data</div>';
+
+    // Activity label
     document.getElementById('act-total-lbl').textContent =
       `Showing ${actOffset+1}–${Math.min(actOffset+actLimit,actTotal)} of ${actTotal.toLocaleString()}`;
+
+    // Table
     const tbody = document.getElementById('act-tbody');
     if(!resp.events.length){
-      tbody.innerHTML = `<tr><td colspan="4" class="empty">No activity in this range</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="4" class="empty">No activity found for this date range</td></tr>`;
     } else {
       tbody.innerHTML = resp.events.map(e => `
         <tr>
-          <td style="color:var(--muted2);white-space:nowrap">${(e.auditdate||'').replace('T',' ').slice(0,16)}</td>
+          <td style="color:var(--muted2);white-space:nowrap;font-size:9px">${fmtTime(e.auditdate)}</td>
           <td><span class="mod-tag">${e.module||'—'}</span></td>
           <td><span class="op-badge ${opClass(e.operation)}">${e.operation||'—'}</span></td>
-          <td style="color:var(--muted2);font-size:9px">${(e.remark||'').slice(0,80)}</td>
+          <td style="color:var(--muted2);font-size:9px;max-width:300px;word-break:break-word">${(e.remark||'').slice(0,100)}</td>
         </tr>`).join('');
     }
-    const maxPage = Math.ceil(actTotal/actLimit);
+
+    // Pager
+    const maxPage = Math.ceil(actTotal/actLimit)||1;
     const curPage = Math.floor(actOffset/actLimit)+1;
     document.getElementById('act-pager').innerHTML = `
       <span>${actTotal.toLocaleString()} total events</span>
@@ -810,6 +925,7 @@ async function loadUserActivity(){
         <span style="color:var(--bright);padding:0 8px">Page ${curPage}/${maxPage}</span>
         <button class="pbtn" onclick="changePage(1)" ${actOffset+actLimit>=actTotal?'disabled':''}>Next →</button>
       </div>`;
+
   } catch(e){ console.error(e); }
 }
 
@@ -825,6 +941,7 @@ function showHome(){
   document.getElementById('view-user').style.display = 'none';
 }
 
+// ── Init ───────────────────────────────────────────────────
 loadStats();
 loadUsers();
 loadLiveFeed();
