@@ -396,10 +396,10 @@ tr:nth-child(even) td{{background:#fafafa}}
 </div></body></html>"""
 
         msg.attach(MIMEText(html, "html"))
-      with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
-        srv.starttls()
-        srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
-        srv.send_message(msg)
+        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
+            srv.starttls()
+            srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
+            srv.send_message(msg)
         print(f"  ✉  Email sent [{event_type}] -> {db}.{table}")
 
     except Exception as e:
@@ -1259,4 +1259,5 @@ if __name__ == "__main__":
     warm_column_cache()
     threading.Thread(target=binlog_monitor, daemon=True).start()
     print("\nDashboard: http://0.0.0.0:5000\n")
+
 
