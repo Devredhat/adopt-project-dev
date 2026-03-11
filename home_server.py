@@ -402,6 +402,42 @@ def api_status():
             status[name] = {"online": False}
     return Response(json.dumps(status), mimetype="application/json")
 
+@home_app.route("/inspect-login-tables")
+def inspect_login_tables():
+    import pymysql, json
+    MYSQL = {"host":"102.209.31.227","port":3306,"user":"clusteradmin",
+             "passwd":"ADOPT@2024#WIOCC@2023","cursorclass":pymysql.cursors.DictCursor}
+    result = {}
+    conn = pymysql.connect(**MYSQL)
+    cur = conn.cursor()
+    
+    tables_to_check = [
+        ("adoptconvergebss", "tbluseraudit"),
+        ("adoptconvergebss", "tblauditlog"),
+        ("adoptconvergebss", "tblstaffuser"),
+        ("adoptradiusbss",   "tbltliveuser"),
+        ("adoptcommonapigateway", "tblmstaffuser"),
+    ]
+    
+    for db, table in tables_to_check:
+        key = f"{db}.{table}"
+        try:
+            # columns
+            cur.execute(f"DESCRIBE `{db}`.`{table}`")
+            cols = [r['Field'] for r in cur.fetchall()]
+            # sample rows
+            cur.execute(f"SELECT * FROM `{db}`.`{table}` ORDER BY 1 DESC LIMIT 3")
+            rows = cur.fetchall()
+            # count
+            cur.execute(f"SELECT COUNT(*) as cnt FROM `{db}`.`{table}`")
+            cnt = cur.fetchone()['cnt']
+            result[key] = {"columns": cols, "count": cnt, "sample": rows}
+        except Exception as e:
+            result[key] = {"error": str(e)}
+    
+    cur.close(); conn.close()
+    return Response(json.dumps(result, indent=2, default=str), mimetype="application/json")
+
 
 def rewrite_html(content, tool_name):
     """
