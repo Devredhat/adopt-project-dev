@@ -38,6 +38,14 @@ def start_tool_3():
     except Exception as e:
         print(f"  [Tool 3] Failed: {e}")
 
+def start_tool_4():
+    try:
+        import user_activity_tool as t4
+        print("  [Tool 4] User Activity → port 6000")
+        t4.app.run(host="0.0.0.0", port=6000, debug=False, use_reloader=False, threaded=True)
+    except Exception as e:
+        print(f"  [Tool 4] Failed: {e}")
+
 def keep_alive():
     import requests
     time.sleep(30)
@@ -61,6 +69,7 @@ TOOLS = {
     "binlog": "http://localhost:5000",
     "fetch":  "http://localhost:7777",
     "ai":     "http://localhost:7000",
+    "users":  "http://localhost:6000",
 }
 
 HOME_HTML = """<!DOCTYPE html>
@@ -547,6 +556,10 @@ def proxy_fetch(path): return proxy_request("fetch", path)
 @home_app.route("/tool/ai/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
 def proxy_ai(path): return proxy_request("ai", path)
 
+@home_app.route("/tool/users/", defaults={"path": ""})
+@home_app.route("/tool/users/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
+def proxy_users(path): return proxy_request("users", path)
+
 
 # ── Main ───────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -557,6 +570,7 @@ if __name__ == "__main__":
     threading.Thread(target=start_tool_1, daemon=True).start(); time.sleep(1)
     threading.Thread(target=start_tool_2, daemon=True).start(); time.sleep(1)
     threading.Thread(target=start_tool_3, daemon=True).start(); time.sleep(2)
+    threading.Thread(target=start_tool_4, daemon=True).start(); time.sleep(1)
     threading.Thread(target=keep_alive,   daemon=True).start()
 
     print(f"\n  ✅  All tools started!")
