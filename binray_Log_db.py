@@ -167,6 +167,29 @@ def uptime_str():
     except:
         return "—"
 
+# ── DAILY RESET ──────────────────────────────────────────────
+def reset_daily_state():
+    while True:
+        from datetime import timedelta
+        now = datetime.now()
+        tomorrow_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        time.sleep((tomorrow_midnight - now).total_seconds())
+        global _event_id
+        STATE["events"].clear()
+        STATE["last_event"] = None
+        STATE["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        STATE["stats"] = {
+            "total_inserts": 0, "total_updates": 0,
+            "total_deletes": 0, "total_soft_deletes": 0,
+            "total_restores": 0, "whatsapp_sent": 0,
+            "whatsapp_failed": 0, "per_table": {},
+        }
+        STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
+        _event_id = 0
+        print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
+
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP via CallMeBot (FREE)
 # ─────────────────────────────────────────────────────────────
@@ -396,8 +419,7 @@ tr:nth-child(even) td{{background:#fafafa}}
 </div></body></html>"""
 
         msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
-            srv.starttls()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
             srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
             srv.send_message(msg)
         print(f"  ✉  Email sent [{event_type}] -> {db}.{table}")
@@ -1258,6 +1280,8 @@ if __name__ == "__main__":
     check_binlog_status()
     warm_column_cache()
     threading.Thread(target=binlog_monitor, daemon=True).start()
+    threading.Thread(target=reset_daily_state, daemon=True).start()
     print("\nDashboard: http://0.0.0.0:5000\n")
+
 
 
