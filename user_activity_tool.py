@@ -87,13 +87,13 @@ def api_stats():
         """, (today,))
         operations = cur.fetchall()
 
-        # Hourly activity today
+        # Hourly activity today — fixed
         cur.execute("""
             SELECT HOUR(auditdate) as hr, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
-            WHERE DATE(auditdate) = %s
+            WHERE auditdate >= %s AND auditdate < DATE_ADD(%s, INTERVAL 1 DAY)
             GROUP BY HOUR(auditdate) ORDER BY hr
-        """, (today,))
+        """, (today, today))
         hourly = {str(r["hr"]): r["cnt"] for r in cur.fetchall()}
 
         cur.close(); conn.close()
@@ -129,24 +129,35 @@ def api_users():
             where += " AND s.sstatus = %s"
             params.append(status)
 
+        # Fast version — no correlated subqueries
         cur.execute(f"""
             SELECT
                 s.staffid, s.firstname, s.lastname, s.username,
                 s.email, s.phone, s.sstatus, s.last_login_time,
                 s.createdate, s.department,
-                (SELECT COUNT(*) FROM adoptconvergebss.tblauditlog a
-                 WHERE a.user_id = s.staffid
-                 AND DATE(a.auditdate) = CURDATE()) as today_actions,
-                (SELECT COUNT(*) FROM adoptconvergebss.tblauditlog a
-                 WHERE a.user_id = s.staffid
-                 AND DATE(a.auditdate) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)) as week_actions,
-                (SELECT a.auditdate FROM adoptconvergebss.tblauditlog a
-                 WHERE a.user_id = s.staffid
-                 ORDER BY a.auditdate DESC LIMIT 1) as last_activity,
-                (SELECT a.module FROM adoptconvergebss.tblauditlog a
-                 WHERE a.user_id = s.staffid
-                 ORDER BY a.auditdate DESC LIMIT 1) as last_module
+                COALESCE(t.today_actions, 0) as today_actions,
+                COALESCE(w.week_actions, 0) as week_actions,
+                la.last_activity, la.last_module
             FROM adoptconvergebss.tblstaffuser s
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) as today_actions
+                FROM adoptconvergebss.tblauditlog
+                WHERE DATE(auditdate) = CURDATE()
+                GROUP BY user_id
+            ) t ON t.user_id = s.staffid
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) as week_actions
+                FROM adoptconvergebss.tblauditlog
+                WHERE DATE(auditdate) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                GROUP BY user_id
+            ) w ON w.user_id = s.staffid
+            LEFT JOIN (
+                SELECT user_id,
+                       MAX(auditdate) as last_activity,
+                       SUBSTRING_INDEX(GROUP_CONCAT(module ORDER BY auditdate DESC), ',', 1) as last_module
+                FROM adoptconvergebss.tblauditlog
+                GROUP BY user_id
+            ) la ON la.user_id = s.staffid
             {where}
             ORDER BY today_actions DESC, last_activity DESC
         """, params)
@@ -193,7 +204,7 @@ def api_user_activity(uid):
         events = cur.fetchall()
 
         # Module breakdown for this user in range
-        cur.execute(f"""
+        cur.execute("""
             SELECT module, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
             WHERE user_id = %s AND DATE(auditdate) BETWEEN %s AND %s
@@ -202,7 +213,7 @@ def api_user_activity(uid):
         modules = cur.fetchall()
 
         # Operation breakdown
-        cur.execute(f"""
+        cur.execute("""
             SELECT operation, COUNT(*) as cnt
             FROM adoptconvergebss.tblauditlog
             WHERE user_id = %s AND DATE(auditdate) BETWEEN %s AND %s
@@ -291,18 +302,12 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospac
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
-
-/* ── Header ── */
-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:0 24px;height:52px;
-  background:var(--surf);border-bottom:1px solid var(--border2);
-  position:sticky;top:0;z-index:100;
-}
+header{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;
+  background:var(--surf);border-bottom:1px solid var(--border2);position:sticky;top:0;z-index:100}
 .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:16px;color:#fff;
-      display:flex;align-items:center;gap:10px;letter-spacing:1px}
+  display:flex;align-items:center;gap:10px;letter-spacing:1px}
 .logo-icon{width:28px;height:28px;background:linear-gradient(135deg,var(--green),#0ea5e9);
-           border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px}
+  border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px}
 .logo-sub{font-size:9px;color:var(--muted2);font-weight:400;font-family:'IBM Plex Mono',monospace;letter-spacing:2px}
 .hbadges{display:flex;gap:8px}
 .badge{padding:3px 10px;border-radius:20px;font-size:9px;font-weight:600;letter-spacing:.5px}
@@ -310,146 +315,111 @@ header{
 .b-ro{background:#f43f5e15;color:var(--red);border:1px solid #f43f5e30}
 .pulse{width:5px;height:5px;border-radius:50%;background:var(--green);animation:blink 1.4s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-
-/* ── Layout ── */
 .layout{display:flex;height:calc(100vh - 52px);overflow:hidden}
 .sidebar{width:320px;flex-shrink:0;background:var(--surf);border-right:1px solid var(--border);
-         display:flex;flex-direction:column;overflow:hidden}
+  display:flex;flex-direction:column;overflow:hidden}
 .main{flex:1;overflow-y:auto;background:var(--bg)}
-
-/* ── Sidebar ── */
 .sb-head{padding:14px 16px;border-bottom:1px solid var(--border);flex-shrink:0}
 .sb-title{font-family:'Syne',sans-serif;font-size:11px;font-weight:700;color:#fff;
-          text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+  text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
 .sb-search{width:100%;background:var(--surf2);border:1px solid var(--border2);
-           color:var(--bright);font-family:inherit;font-size:10px;padding:7px 10px;
-           border-radius:6px;outline:none;transition:border-color .15s}
+  color:var(--bright);font-family:inherit;font-size:10px;padding:7px 10px;
+  border-radius:6px;outline:none;transition:border-color .15s}
 .sb-search:focus{border-color:var(--green)}
 .sb-filters{display:flex;gap:5px;margin-top:8px}
 .sf{font-size:9px;padding:3px 8px;border-radius:4px;border:1px solid var(--border2);
-    background:transparent;color:var(--muted2);cursor:pointer;font-family:inherit;transition:all .15s}
+  background:transparent;color:var(--muted2);cursor:pointer;font-family:inherit;transition:all .15s}
 .sf:hover,.sf.active{border-color:var(--green);color:var(--green);background:#00e67610}
 .sb-list{flex:1;overflow-y:auto}
 .user-row{padding:10px 16px;border-bottom:1px solid var(--border);cursor:pointer;
-          transition:background .1s;display:flex;align-items:center;gap:10px}
+  transition:background .1s;display:flex;align-items:center;gap:10px}
 .user-row:hover{background:var(--surf2)}
 .user-row.active{background:var(--surf3);border-left:2px solid var(--green)}
 .user-avatar{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;
-             justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;
-             font-family:'Syne',sans-serif}
+  justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;font-family:'Syne',sans-serif}
 .user-info{flex:1;min-width:0}
 .user-name{font-size:11px;color:var(--bright);font-weight:600;
-           white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .user-role{font-size:9px;color:var(--muted2);margin-top:1px;
-           white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .user-badge{flex-shrink:0;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600}
-.ub-active{background:#00e67615;color:var(--green)}
 .ub-today{background:#38bdf815;color:var(--blue)}
 .ub-none{background:#2a3d5230;color:var(--muted2)}
-
-/* ── Main content ── */
 .main-inner{padding:20px 24px}
-
-/* Stats row */
 .stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:20px}
 .stat-card{background:var(--surf);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
 .stat-label{font-size:9px;color:var(--muted2);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
 .stat-val{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;line-height:1}
 .stat-sub{font-size:9px;color:var(--muted2);margin-top:4px}
-
-/* Panel */
-.panel{background:var(--surf);border:1px solid var(--border);border-radius:10px;
-       margin-bottom:16px;overflow:hidden}
+.panel{background:var(--surf);border:1px solid var(--border);border-radius:10px;margin-bottom:16px;overflow:hidden}
 .panel-head{padding:12px 16px;border-bottom:1px solid var(--border);
-            display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .panel-title{font-family:'Syne',sans-serif;font-size:12px;font-weight:700;color:#fff}
 .panel-body{max-height:420px;overflow-y:auto}
-
-/* User detail header */
 .user-detail-head{background:var(--surf2);padding:18px 20px;border-bottom:1px solid var(--border);
-                  display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
+  display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
 .udh-avatar{width:52px;height:52px;border-radius:12px;display:flex;align-items:center;
-            justify-content:center;font-size:18px;font-weight:800;font-family:'Syne',sans-serif;flex-shrink:0}
+  justify-content:center;font-size:18px;font-weight:800;font-family:'Syne',sans-serif;flex-shrink:0}
 .udh-info{flex:1}
 .udh-name{font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#fff;line-height:1.2}
 .udh-username{font-size:10px;color:var(--muted2);margin-top:3px}
 .udh-meta{display:flex;gap:10px;margin-top:8px;flex-wrap:wrap}
 .udh-tag{font-size:9px;padding:2px 8px;border-radius:4px;border:1px solid}
-
-/* Activity table */
 .act-table{width:100%;border-collapse:collapse;font-size:10px}
 .act-table th{padding:8px 12px;text-align:left;color:var(--muted2);font-size:9px;
-              text-transform:uppercase;letter-spacing:.6px;background:var(--surf2);
-              border-bottom:1px solid var(--border);position:sticky;top:0}
+  text-transform:uppercase;letter-spacing:.6px;background:var(--surf2);
+  border-bottom:1px solid var(--border);position:sticky;top:0}
 .act-table td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
 .act-table tr:hover td{background:#ffffff04}
 .op-badge{padding:2px 7px;border-radius:4px;font-size:9px;font-weight:600}
 .op-view{background:#38bdf815;color:var(--blue)}
-.op-add,.op-create,.op-insert{background:#00e67615;color:var(--green)}
-.op-update,.op-edit,.op-modify{background:#fbbf2415;color:var(--yellow)}
-.op-delete,.op-remove{background:#f43f5e15;color:var(--red)}
-.op-login,.op-logout{background:#a78bfa15;color:var(--purple)}
+.op-add{background:#00e67615;color:var(--green)}
+.op-update{background:#fbbf2415;color:var(--yellow)}
+.op-delete{background:#f43f5e15;color:var(--red)}
+.op-login{background:#a78bfa15;color:var(--purple)}
 .op-default{background:#2a3d52;color:var(--muted2)}
 .mod-tag{padding:2px 7px;border-radius:4px;font-size:9px;background:var(--surf3);
-         color:var(--text);border:1px solid var(--border2)}
-
-/* Module bars */
+  color:var(--text);border:1px solid var(--border2)}
 .mod-bar-row{display:flex;align-items:center;gap:10px;padding:8px 16px;
-             border-bottom:1px solid var(--border);font-size:10px}
+  border-bottom:1px solid var(--border);font-size:10px}
 .mod-bar-name{width:130px;color:var(--bright);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mod-bar-wrap{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .mod-bar-fill{height:6px;border-radius:3px;transition:width .4s}
 .mod-bar-cnt{width:50px;text-align:right;color:var(--muted2)}
-
-/* Hour chart */
 .hour-chart{display:flex;align-items:flex-end;gap:3px;height:60px;padding:8px 16px 4px}
 .hour-bar-wrap{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px}
 .hour-bar{width:100%;background:var(--green);border-radius:2px 2px 0 0;
-          min-height:2px;transition:height .3s;opacity:.7}
+  min-height:2px;transition:height .3s;opacity:.7}
 .hour-bar:hover{opacity:1}
 .hour-lbl{font-size:7px;color:var(--muted);margin-top:3px}
-
-/* Live feed */
 .feed-row{display:flex;gap:10px;padding:8px 16px;border-bottom:1px solid var(--border);
-          font-size:10px;align-items:flex-start;cursor:pointer;transition:background .1s}
+  font-size:10px;align-items:flex-start;cursor:pointer;transition:background .1s}
 .feed-row:hover{background:var(--surf2)}
 .feed-time{color:var(--muted2);white-space:nowrap;font-size:9px;margin-top:1px;min-width:120px}
 .feed-user{color:var(--bright);font-weight:600;white-space:nowrap;overflow:hidden;
-           text-overflow:ellipsis;min-width:120px;max-width:140px}
+  text-overflow:ellipsis;min-width:120px;max-width:140px}
 .feed-detail{color:var(--text);flex:1;min-width:0}
-
-/* Pagination */
 .pager{padding:8px 16px;display:flex;align-items:center;justify-content:space-between;
-       border-top:1px solid var(--border);font-size:9px;color:var(--muted2)}
+  border-top:1px solid var(--border);font-size:9px;color:var(--muted2)}
 .pager-btns{display:flex;gap:6px}
 .pbtn{background:transparent;border:1px solid var(--border2);color:var(--muted2);
-      font-family:inherit;font-size:9px;padding:3px 8px;border-radius:4px;cursor:pointer;transition:all .15s}
+  font-family:inherit;font-size:9px;padding:3px 8px;border-radius:4px;cursor:pointer;transition:all .15s}
 .pbtn:hover:not(:disabled){border-color:var(--green);color:var(--green)}
 .pbtn:disabled{opacity:.3;cursor:default}
-
-/* Filters */
 .flt-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .flt-input{background:var(--surf2);border:1px solid var(--border2);color:var(--bright);
-           font-family:inherit;font-size:10px;padding:5px 10px;border-radius:6px;outline:none}
+  font-family:inherit;font-size:10px;padding:5px 10px;border-radius:6px;outline:none}
 .flt-input:focus{border-color:var(--green)}
-
-/* Home view */
 .home-view{padding:0}
-
-/* Module ops grid */
 .ops-grid{display:grid;grid-template-columns:1fr 1fr;gap:0}
 .ops-item{padding:10px 16px;border-bottom:1px solid var(--border);
-          border-right:1px solid var(--border);display:flex;align-items:center;
-          justify-content:space-between;font-size:10px}
+  border-right:1px solid var(--border);display:flex;align-items:center;
+  justify-content:space-between;font-size:10px}
 .ops-item:nth-child(2n){border-right:none}
-
-/* Empty */
 .empty{padding:40px;text-align:center;color:var(--muted2);font-size:11px}
-
-/* Loading */
 .loading{display:flex;align-items:center;justify-content:center;padding:30px;gap:10px;color:var(--muted2);font-size:11px}
 .spin{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--green);
-      border-radius:50%;animation:spin .7s linear infinite}
+  border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
@@ -466,13 +436,11 @@ header{
   <div class="hbadges">
     <span class="badge b-live"><span class="pulse"></span>LIVE</span>
     <span class="badge b-ro">READ ONLY</span>
-    <span class="badge" style="background:#fbbf2415;color:var(--yellow);border:1px solid #fbbf2430"
-          id="total-badge">— STAFF</span>
+    <span class="badge" style="background:#fbbf2415;color:var(--yellow);border:1px solid #fbbf2430" id="total-badge">— STAFF</span>
   </div>
 </header>
 
 <div class="layout">
-  <!-- Sidebar: user list -->
   <div class="sidebar">
     <div class="sb-head">
       <div class="sb-title">Staff Users</div>
@@ -488,15 +456,12 @@ header{
     </div>
   </div>
 
-  <!-- Main content -->
   <div class="main">
     <div id="view-home" class="main-inner home-view">
-      <!-- Stats -->
       <div class="stats-row" id="stats-row">
         <div class="loading"><div class="spin"></div></div>
       </div>
 
-      <!-- Hourly chart -->
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">📊 Today's Activity by Hour</div>
@@ -505,7 +470,6 @@ header{
         <div id="hour-chart-wrap"></div>
       </div>
 
-      <!-- Modules + Operations side by side -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
         <div class="panel">
           <div class="panel-head"><div class="panel-title">🗂 Module Activity (Today)</div></div>
@@ -517,7 +481,6 @@ header{
         </div>
       </div>
 
-      <!-- Live feed -->
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">🔴 Live Activity Feed</div>
@@ -529,14 +492,11 @@ header{
       </div>
     </div>
 
-    <!-- User detail view -->
     <div id="view-user" style="display:none">
       <div id="user-detail-head"></div>
       <div class="main-inner" style="padding-top:16px">
-        <!-- Mini stats -->
         <div class="stats-row" id="user-stats-row"></div>
 
-        <!-- Filters -->
         <div class="panel" style="margin-bottom:16px">
           <div class="panel-head">
             <div class="panel-title">🔍 Filter Activity</div>
@@ -554,7 +514,6 @@ header{
           </div>
         </div>
 
-        <!-- Module breakdown -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
           <div class="panel">
             <div class="panel-head"><div class="panel-title">🗂 Modules Used</div></div>
@@ -566,7 +525,6 @@ header{
           </div>
         </div>
 
-        <!-- Activity log -->
         <div class="panel">
           <div class="panel-head">
             <div class="panel-title">📋 Activity Log</div>
@@ -576,10 +534,7 @@ header{
             <table class="act-table">
               <thead>
                 <tr>
-                  <th>Time</th>
-                  <th>Module</th>
-                  <th>Operation</th>
-                  <th>Details</th>
+                  <th>Time</th><th>Module</th><th>Operation</th><th>Details</th>
                 </tr>
               </thead>
               <tbody id="act-tbody"></tbody>
@@ -593,7 +548,6 @@ header{
 </div>
 
 <script>
-// ── State ──────────────────────────────────────────────────
 let allUsers = [];
 let filteredUsers = [];
 let statusFilter = '';
@@ -602,7 +556,6 @@ let actOffset = 0;
 const actLimit = 100;
 let actTotal = 0;
 
-// ── Colors ─────────────────────────────────────────────────
 const COLORS = ['#00e676','#38bdf8','#fb923c','#a78bfa','#fbbf24','#f43f5e','#34d399','#818cf8'];
 function avatarColor(id){ return COLORS[id % COLORS.length]; }
 function initials(fn, ln){ return ((fn||'?')[0]+(ln||'?')[0]).toUpperCase(); }
@@ -615,20 +568,16 @@ function opClass(op){
   if(o.includes('update')||o.includes('edit')||o.includes('modif')) return 'op-update';
   if(o.includes('delet')||o.includes('remov')) return 'op-delete';
   if(o.includes('login')) return 'op-login';
-  if(o.includes('logout')) return 'op-logout';
+  if(o.includes('logout')) return 'op-login';
   return 'op-default';
 }
 
-// ── Load stats ─────────────────────────────────────────────
 async function loadStats(){
   try{
     const s = await fetch('/api/stats').then(r=>r.json());
     if(s.error){ console.error(s.error); return; }
-
     document.getElementById('today-lbl').textContent = s.today;
     document.getElementById('total-badge').textContent = `${s.total_staff} STAFF`;
-
-    // Stats row
     document.getElementById('stats-row').innerHTML = `
       <div class="stat-card">
         <div class="stat-label">Total Staff</div>
@@ -650,8 +599,6 @@ async function loadStats(){
         <div class="stat-val" style="color:var(--orange);font-size:14px;margin-top:4px">${s.top_user ? s.top_user.user_name : '—'}</div>
         <div class="stat-sub">${s.top_user ? s.top_user.cnt+' actions' : ''}</div>
       </div>`;
-
-    // Hourly chart
     const maxH = Math.max(...Object.values(s.hourly||{}), 1);
     let hhtml = '<div class="hour-chart">';
     for(let i=0;i<24;i++){
@@ -664,31 +611,23 @@ async function loadStats(){
     }
     hhtml += '</div>';
     document.getElementById('hour-chart-wrap').innerHTML = hhtml;
-
-    // Module bars
     const maxM = Math.max(...(s.modules||[]).map(m=>m.cnt), 1);
     document.getElementById('module-bars').innerHTML =
       (s.modules||[]).map((m,i) => `
         <div class="mod-bar-row">
           <div class="mod-bar-name">${m.module||'Unknown'}</div>
-          <div class="mod-bar-wrap">
-            <div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div>
-          </div>
+          <div class="mod-bar-wrap"><div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div></div>
           <div class="mod-bar-cnt">${m.cnt}</div>
         </div>`).join('') || '<div class="empty">No data</div>';
-
-    // Operations grid
     document.getElementById('ops-grid').innerHTML =
       (s.operations||[]).map(o => `
         <div class="ops-item">
           <span class="op-badge ${opClass(o.operation)}">${o.operation||'Unknown'}</span>
           <span style="color:var(--bright);font-weight:600">${o.cnt}</span>
         </div>`).join('') || '<div class="empty">No data</div>';
-
   } catch(e){ console.error(e); }
 }
 
-// ── Load users ─────────────────────────────────────────────
 async function loadUsers(){
   try{
     const resp = await fetch('/api/users').then(r=>r.json());
@@ -744,7 +683,6 @@ function renderUserList(){
   }).join('');
 }
 
-// ── Live feed ───────────────────────────────────────────────
 async function loadLiveFeed(){
   try{
     const resp = await fetch('/api/live_feed').then(r=>r.json());
@@ -766,28 +704,21 @@ async function loadLiveFeed(){
   } catch(e){ console.error(e); }
 }
 
-// ── User detail ─────────────────────────────────────────────
 async function openUser(uid){
   activeUserId = uid;
   renderUserList();
-
   document.getElementById('view-home').style.display = 'none';
   document.getElementById('view-user').style.display = 'block';
-
-  // Set default dates
   const today = new Date().toISOString().split('T')[0];
   const week  = new Date(Date.now()-7*86400000).toISOString().split('T')[0];
   document.getElementById('date-from').value = week;
   document.getElementById('date-to').value   = today;
-
-  // Load modules for filter
   try{
     const mods = await fetch('/api/modules').then(r=>r.json());
     const sel = document.getElementById('mod-filter');
     sel.innerHTML = '<option value="">All Modules</option>' +
       mods.map(m=>`<option value="${m}">${m}</option>`).join('');
   } catch(e){}
-
   actOffset = 0;
   await loadUserActivity();
 }
@@ -797,20 +728,15 @@ async function loadUserActivity(){
   const from = document.getElementById('date-from').value;
   const to   = document.getElementById('date-to').value;
   const mod  = document.getElementById('mod-filter').value;
-
   try{
     const resp = await fetch(
       `/api/user/${uid}/activity?from=${from}&to=${to}&module=${encodeURIComponent(mod)}&limit=${actLimit}&offset=${actOffset}`
     ).then(r=>r.json());
-
     if(resp.error){ console.error(resp.error); return; }
     actTotal = resp.total;
-
     const u = resp.user || {};
     const color = avatarColor(u.staffid||0);
     const name = `${u.firstname||''} ${u.lastname||''}`.trim();
-
-    // Header
     document.getElementById('user-detail-head').innerHTML = `
       <div class="user-detail-head">
         <div class="udh-avatar" style="background:${color}20;color:${color};border:1px solid ${color}40">
@@ -820,9 +746,7 @@ async function loadUserActivity(){
           <div class="udh-name">${name||u.username||'—'}</div>
           <div class="udh-username">@${u.username||'—'} · ${u.email||'—'}</div>
           <div class="udh-meta">
-            <span class="udh-tag" style="color:${u.sstatus==='ACTIVE'?'var(--green)':'var(--red)'};border-color:${u.sstatus==='ACTIVE'?'#00e67640':'#f43f5e40'}">
-              ${u.sstatus||'—'}
-            </span>
+            <span class="udh-tag" style="color:${u.sstatus==='ACTIVE'?'var(--green)':'var(--red)'};border-color:${u.sstatus==='ACTIVE'?'#00e67640':'#f43f5e40'}">${u.sstatus||'—'}</span>
             ${u.department?`<span class="udh-tag" style="color:var(--blue);border-color:#38bdf840">${u.department}</span>`:''}
             ${u.phone?`<span class="udh-tag" style="color:var(--muted2);border-color:var(--border2)">📞 ${u.phone}</span>`:''}
             ${u.last_login_time?`<span class="udh-tag" style="color:var(--yellow);border-color:#fbbf2440">Last Login: ${u.last_login_time}</span>`:''}
@@ -836,8 +760,6 @@ async function loadUserActivity(){
           </div>
         </div>
       </div>`;
-
-    // User stats
     document.getElementById('user-stats-row').innerHTML = `
       <div class="stat-card">
         <div class="stat-label">Total in Range</div>
@@ -851,31 +773,22 @@ async function loadUserActivity(){
         <div class="stat-label">Operation Types</div>
         <div class="stat-val" style="color:var(--orange)">${resp.operations.length}</div>
       </div>`;
-
-    // Module bars
     const maxM = Math.max(...(resp.modules||[]).map(m=>m.cnt),1);
     document.getElementById('user-module-bars').innerHTML =
       (resp.modules||[]).map((m,i) => `
         <div class="mod-bar-row">
           <div class="mod-bar-name">${m.module}</div>
-          <div class="mod-bar-wrap">
-            <div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div>
-          </div>
+          <div class="mod-bar-wrap"><div class="mod-bar-fill" style="width:${Math.round(m.cnt/maxM*100)}%;background:${COLORS[i%COLORS.length]}"></div></div>
           <div class="mod-bar-cnt">${m.cnt}</div>
         </div>`).join('') || '<div class="empty">No data</div>';
-
-    // Ops grid
     document.getElementById('user-ops-grid').innerHTML =
       (resp.operations||[]).map(o => `
         <div class="ops-item">
           <span class="op-badge ${opClass(o.operation)}">${o.operation}</span>
           <span style="color:var(--bright);font-weight:600">${o.cnt}</span>
         </div>`).join('') || '<div class="empty">No data</div>';
-
-    // Activity table
     document.getElementById('act-total-lbl').textContent =
       `Showing ${actOffset+1}–${Math.min(actOffset+actLimit,actTotal)} of ${actTotal.toLocaleString()}`;
-
     const tbody = document.getElementById('act-tbody');
     if(!resp.events.length){
       tbody.innerHTML = `<tr><td colspan="4" class="empty">No activity in this range</td></tr>`;
@@ -888,8 +801,6 @@ async function loadUserActivity(){
           <td style="color:var(--muted2);font-size:9px">${(e.remark||'').slice(0,80)}</td>
         </tr>`).join('');
     }
-
-    // Pager
     const maxPage = Math.ceil(actTotal/actLimit);
     const curPage = Math.floor(actOffset/actLimit)+1;
     document.getElementById('act-pager').innerHTML = `
@@ -899,7 +810,6 @@ async function loadUserActivity(){
         <span style="color:var(--bright);padding:0 8px">Page ${curPage}/${maxPage}</span>
         <button class="pbtn" onclick="changePage(1)" ${actOffset+actLimit>=actTotal?'disabled':''}>Next →</button>
       </div>`;
-
   } catch(e){ console.error(e); }
 }
 
@@ -915,12 +825,11 @@ function showHome(){
   document.getElementById('view-user').style.display = 'none';
 }
 
-// ── Init ────────────────────────────────────────────────────
 loadStats();
 loadUsers();
 loadLiveFeed();
-setInterval(loadLiveFeed, 15000);  // live feed refresh every 15s
-setInterval(loadStats, 60000);     // stats refresh every 1 min
+setInterval(loadLiveFeed, 15000);
+setInterval(loadStats, 60000);
 </script>
 </body>
 </html>"""
