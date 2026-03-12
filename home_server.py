@@ -588,6 +588,60 @@ def proxy_ai(path): return proxy_request("ai", path)
 @home_app.route("/tool/users/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
 def proxy_users(path): return proxy_request("users", path)
 
+@home_app.route("/schema-inspect")
+def schema_inspect():
+    import pymysql, json
+    conn = pymysql.connect(
+        host="102.209.31.227", port=3306,
+        user="clusteradmin", passwd="ADOPT@2024#WIOCC@2023",
+        cursorclass=pymysql.cursors.DictCursor
+    )
+    cur = conn.cursor()
+
+    # All databases
+    cur.execute("SHOW DATABASES")
+    dbs = [r["Database"] for r in cur.fetchall()
+           if r["Database"] not in ("information_schema","performance_schema","mysql","sys")]
+
+    result = {}
+    for db in dbs:
+        result[db] = {}
+        try:
+            cur.execute(f"SHOW TABLES FROM `{db}`")
+            tables = [list(r.values())[0] for r in cur.fetchall()]
+            for tbl in tables:
+                try:
+                    # Primary + Foreign keys
+                    cur.execute(f"""
+                        SELECT
+                            kcu.COLUMN_NAME,
+                            kcu.CONSTRAINT_NAME,
+                            tc.CONSTRAINT_TYPE,
+                            kcu.REFERENCED_TABLE_SCHEMA,
+                            kcu.REFERENCED_TABLE_NAME,
+                            kcu.REFERENCED_COLUMN_NAME
+                        FROM information_schema.KEY_COLUMN_USAGE kcu
+                        JOIN information_schema.TABLE_CONSTRAINTS tc
+                            ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                            AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                            AND tc.TABLE_NAME = kcu.TABLE_NAME
+                        WHERE kcu.TABLE_SCHEMA = '{db}'
+                          AND kcu.TABLE_NAME = '{tbl}'
+                        ORDER BY tc.CONSTRAINT_TYPE
+                    """)
+                    keys = cur.fetchall()
+                    if keys:
+                        result[db][tbl] = keys
+                except:
+                    pass
+        except:
+            pass
+
+    cur.close(); conn.close()
+    return __import__('flask').Response(
+        json.dumps(result, indent=2, default=str),
+        mimetype="application/json"
+    )
 
 # ── Main ───────────────────────────────────────────────────
 if __name__ == "__main__":
