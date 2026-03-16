@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # ============================================================
 #  ADOPT Infrastructure Suite — Master Server (v3 Fixed)
 #  Fix: binlog file not found via proxy
@@ -38,14 +37,6 @@ def start_tool_3():
     except Exception as e:
         print(f"  [Tool 3] Failed: {e}")
 
-def start_tool_4():
-    try:
-        import user_activity_tool as t4
-        print("  [Tool 4] User Activity → port 6000")
-        t4.app.run(host="0.0.0.0", port=6000, debug=False, use_reloader=False, threaded=True)
-    except Exception as e:
-        print(f"  [Tool 4] Failed: {e}")
-
 def keep_alive():
     import requests
     time.sleep(30)
@@ -69,7 +60,6 @@ TOOLS = {
     "binlog": "http://localhost:5000",
     "fetch":  "http://localhost:7777",
     "ai":     "http://localhost:7000",
-    "users":  "http://localhost:6000",
 }
 
 HOME_HTML = """<!DOCTYPE html>
@@ -82,7 +72,7 @@ HOME_HTML = """<!DOCTYPE html>
 <style>
 :root{--bg:#05080f;--bg2:#080d18;--surf:#0c1220;--border:#182035;--border2:#1e2d45;
       --text:#8ba3c4;--bright:#dce8f8;--muted:#2d3f58;--muted2:#3d5570;
-      --binlog:#22d87a;--fetch:#6366f1;--ai:#f59e0b;--users:#00e676}
+      --binlog:#22d87a;--fetch:#6366f1;--ai:#f59e0b;}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden}
 body{background:var(--bg);color:var(--text);font-family:'Space Mono',monospace;height:100vh;display:flex;flex-direction:column}
@@ -219,9 +209,6 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
   .nav-btn{padding:0 7px;font-size:9px}.nav-badge,.nav-dot{display:none}
   .hero{padding:40px 12px 28px}.tools-grid,.stats-bar{padding:0 10px}.tools-grid{padding-bottom:40px}
 }
-.btn-users::after{background:var(--users)}.btn-users.active{color:var(--users);border-bottom-color:var(--users)}
-.btn-users .nav-dot{background:var(--users)}
-.btn-users .nav-badge{background:#00e67615;color:var(--users);border:1px solid #00e67630}
 </style>
 </head>
 <body>
@@ -238,9 +225,6 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
     </button>
     <button class="nav-btn btn-ai" id="nav-ai" onclick="showView('ai')">
       <span class="nav-dot"></span>DATABASE AI<span class="nav-badge">AI</span>
-    </button>
-    <button class="nav-btn btn-users" id="nav-users" onclick="showView('users')">
-      <span class="nav-dot"></span>USER ACTIVITY<span class="nav-badge">NEW</span>
     </button>
   </div>
   <div class="nav-spacer"></div>
@@ -311,20 +295,6 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
           <div class="card-footer"><div class="card-port">Port: <b>7000</b></div>
             <button class="card-open" onclick="event.stopPropagation();showView('ai')">Open →</button></div>
         </div>
-        <div class="tool-card card-binlog" onclick="showView('users')" style="--binlog:#00e676">
-          <div class="card-num">04</div>
-          <div class="card-header"><div class="card-icon">👤</div><div class="card-tag" style="background:#00e67612;color:#00e676;border:1px solid #00e67630">● NEW</div></div>
-          <div class="card-title">User Activity Dashboard</div>
-          <div class="card-desc">Track staff login history, module usage, and audit trail across all 125 staff users.</div>
-          <div class="card-features">
-            <div class="card-feat">938K+ audit events</div>
-            <div class="card-feat">Per-user activity history</div>
-            <div class="card-feat">Module & operation breakdown</div>
-            <div class="card-feat">Live activity feed</div>
-          </div>
-          <div class="card-footer"><div class="card-port">Port: <b style="color:#00e676">6000</b></div>
-            <button class="card-open" style="color:#00e676;border-color:#00e67640;background:#00e67608" onclick="event.stopPropagation();showView('users')">Open →</button></div>
-        </div>
       </div>
       <footer>
         <span class="footer-logo">ADOPT · INFRASTRUCTURE SUITE</span>
@@ -357,25 +327,17 @@ footer{border-top:1px solid var(--border);padding:14px 32px;display:flex;align-i
     </div>
     <iframe class="tool-frame" id="frame-ai" src="about:blank"></iframe>
   </div>
-  <div class="view" id="view-users" style="position:relative">
-    <div class="offline-overlay" id="off-users">
-      <div style="font-size:36px">👤</div><b style="color:#00e676">User Activity loading...</b>
-      <div style="font-size:11px;color:#4a5a75">Please wait</div>
-      <button class="retry-btn" onclick="reloadFrame('users')" style="color:#00e676;border-color:#00e67640;background:#00e6760a">↺ Retry</button>
-    </div>
-    <iframe class="tool-frame" id="frame-users" src="about:blank"></iframe>
-  </div>
 </div>
 <script>
-const loaded={binlog:false,fetch:false,ai:false,users:false};
-const labels={binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI',users:'👤 User Activity'};
+const loaded={binlog:false,fetch:false,ai:false};
+const labels={binlog:'⚡ Live Monitor',fetch:'📂 File Reader',ai:'🤖 Database AI'};
 function showView(name){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('view-'+name).classList.add('active');
   document.getElementById('nav-'+name).classList.add('active');
   if(name!=='home'&&!loaded[name]) loadFrame(name);
-  const t={home:'ADOPT · Suite',binlog:'ADOPT · Live Monitor',fetch:'ADOPT · File Reader',ai:'ADOPT · Database AI',users:'ADOPT · User Activity'};
+  const t={home:'ADOPT · Suite',binlog:'ADOPT · Live Monitor',fetch:'ADOPT · File Reader',ai:'ADOPT · Database AI'};
   document.title=t[name]||'ADOPT';
 }
 function loadFrame(name){
@@ -419,7 +381,6 @@ def ping():
 def myip():
     import json
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    all_headers = {k: v for k, v in request.headers}
     return Response(json.dumps({
         "remote_addr": request.remote_addr,
         "x_forwarded_for": request.headers.get("X-Forwarded-For"),
@@ -447,7 +408,7 @@ def inspect_login_tables():
     result = {}
     conn = pymysql.connect(**MYSQL)
     cur = conn.cursor()
-    
+
     tables_to_check = [
         ("adoptconvergebss", "tbluseraudit"),
         ("adoptconvergebss", "tblauditlog"),
@@ -455,37 +416,26 @@ def inspect_login_tables():
         ("adoptradiusbss",   "tbltliveuser"),
         ("adoptcommonapigateway", "tblmstaffuser"),
     ]
-    
+
     for db, table in tables_to_check:
         key = f"{db}.{table}"
         try:
-            # columns
             cur.execute(f"DESCRIBE `{db}`.`{table}`")
             cols = [r['Field'] for r in cur.fetchall()]
-            # sample rows
             cur.execute(f"SELECT * FROM `{db}`.`{table}` ORDER BY 1 DESC LIMIT 3")
             rows = cur.fetchall()
-            # count
             cur.execute(f"SELECT COUNT(*) as cnt FROM `{db}`.`{table}`")
             cnt = cur.fetchone()['cnt']
             result[key] = {"columns": cols, "count": cnt, "sample": rows}
         except Exception as e:
             result[key] = {"error": str(e)}
-    
+
     cur.close(); conn.close()
     return Response(json.dumps(result, indent=2, default=str), mimetype="application/json")
 
 
 def rewrite_html(content, tool_name):
-    """
-    Rewrite internal URLs — skip already-prefixed /tool/ paths
-    to avoid double rewriting.
-    """
     prefix = f"/tool/{tool_name}"
-
-    # Only rewrite paths NOT already starting with /tool/
-    # Match: attr="/path  but NOT attr="/tool/
-    # The path must start with / followed by a word char (not a quote or space)
     for attr in ["src", "href", "action"]:
         for q in ['"', "'"]:
             content = re.sub(
@@ -493,16 +443,11 @@ def rewrite_html(content, tool_name):
                 f'{attr}={q}{prefix}/',
                 content
             )
-
-    # fetch() calls
     content = re.sub(r"fetch\('/(?!tool/)", f"fetch('{prefix}/", content)
     content = re.sub(r'fetch\("/(?!tool/)', f'fetch("{prefix}/', content)
     content = re.sub(r"fetch\(`/(?!tool/)", f"fetch(`{prefix}/", content)
-
-    # window.open()
     content = re.sub(r"window\.open\('/(?!tool/)", f"window.open('{prefix}/", content)
     content = re.sub(r'window\.open\("/(?!tool/)', f'window.open("{prefix}/', content)
-
     return content
 
 
@@ -511,7 +456,6 @@ def proxy_request(tool_name, path):
     if not base_url:
         return Response(f"Unknown tool: {tool_name}", status=404)
 
-    # Clean path — remove any accidental double slashes
     clean_path = path.lstrip("/")
     target_url = f"{base_url.rstrip('/')}/{clean_path}"
     if request.query_string:
@@ -524,14 +468,14 @@ def proxy_request(tool_name, path):
                    if k.lower() not in ("host", "content-length")}
 
         resp = req.request(
-            method        = request.method,
-            url           = target_url,
-            headers       = headers,
-            data          = request.get_data(),
-            cookies       = request.cookies,
+            method          = request.method,
+            url             = target_url,
+            headers         = headers,
+            data            = request.get_data(),
+            cookies         = request.cookies,
             allow_redirects = False,
-            timeout       = 30,
-            stream        = True,
+            timeout         = 30,
+            stream          = True,
         )
 
         excluded     = ["content-encoding", "content-length",
@@ -546,7 +490,6 @@ def proxy_request(tool_name, path):
             return Response(content, status=resp.status_code,
                             headers=resp_headers, content_type=content_type)
 
-        # JSON / static files — pass through unchanged
         return Response(
             resp.iter_content(chunk_size=8192),
             status       = resp.status_code,
@@ -555,7 +498,6 @@ def proxy_request(tool_name, path):
         )
 
     except req.exceptions.ConnectionError:
-        # Return a friendly retry page — NOT a JSON error
         return Response(
             f"""<!DOCTYPE html><html><body style="background:#05080f;color:#f43f5e;
             font-family:monospace;display:flex;align-items:center;justify-content:center;
@@ -584,10 +526,6 @@ def proxy_fetch(path): return proxy_request("fetch", path)
 @home_app.route("/tool/ai/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
 def proxy_ai(path): return proxy_request("ai", path)
 
-@home_app.route("/tool/users/", defaults={"path": ""})
-@home_app.route("/tool/users/<path:path>", methods=["GET","POST","PUT","DELETE","PATCH"])
-def proxy_users(path): return proxy_request("users", path)
-
 
 # ── Main ───────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -598,7 +536,6 @@ if __name__ == "__main__":
     threading.Thread(target=start_tool_1, daemon=True).start(); time.sleep(1)
     threading.Thread(target=start_tool_2, daemon=True).start(); time.sleep(1)
     threading.Thread(target=start_tool_3, daemon=True).start(); time.sleep(2)
-    threading.Thread(target=start_tool_4, daemon=True).start(); time.sleep(1)
     threading.Thread(target=keep_alive,   daemon=True).start()
 
     print(f"\n  ✅  All tools started!")
