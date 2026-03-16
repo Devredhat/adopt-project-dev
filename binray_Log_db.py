@@ -11,7 +11,7 @@
 #   ✔ Per-database tab view
 #   ✔ Event detail popup on click
 #   ✔ Uptime + connection status
-#   ✔ WhatsApp notifications via CallMeBot (FREE)
+#   ✔ WhatsApp notifications via Green API
 #
 # REQUIREMENTS:
 #   pip install flask pymysql mysql-replication requests
@@ -41,33 +41,26 @@ app = Flask(__name__)
 EMAIL_CONFIG = {
     "enabled":         True,
     "smtp_server":     "smtp.gmail.com",
-    "smtp_port":       587,
+    "smtp_port":       587,          # 587 = STARTTLS  |  465 = SSL
     "sender_email":    "mbsuthar32@gmail.com",
-    "sender_password": "dryfbgqdixyuqprf",
+    "sender_password": "dryfbgqdixyuqprf",   # Gmail App Password (16 chars, no spaces)
     "recipient_email": "mbsuthar32@gmail.com",
 }
 
 # ─────────────────────────────────────────────────────────────
-#  WHATSAPP CONFIG (Green API - https://green-api.com)
-# ─────────────────────────────────────────────────────────────
-# SETUP STEPS:
-#   1. Go to https://console.green-api.com
-#   2. Open your instance → click "Link with QR code"
-#   3. Scan with WhatsApp → Status must show "Authorized"
-#   4. Fill in the values below
+#  WHATSAPP CONFIG (Green API)
 # ─────────────────────────────────────────────────────────────
 WHATSAPP_CONFIG = {
     "enabled":          True,
-    "id_instance":      "7103531926",                              # Your idInstance
-    "api_token":        "8577c63fab924f8a8b8eacefb44a8fae701a844527f84e22b4",  # apiTokenInstance
-    "api_url":          "https://7103.api.greenapi.com",           # apiUrl from dashboard
-    "recipient_phone":  "919510251732",                            # Recipient number WITHOUT + (e.g. 919876543210 for +91...)
-    # Which events to send on WhatsApp:
-    "on_insert_customer": True,   # New customer INSERT
-    "on_delete":          True,   # Any DELETE
-    "on_soft_delete":     True,   # Soft DELETE (is_delete=1)
-    "on_restore":         False,  # Restored records
-    "on_update":          False,  # All UPDATEs (can be noisy!)
+    "id_instance":      "7103531926",
+    "api_token":        "8577c63fab924f8a8b8eacefb44a8fae701a844527f84e22b4",
+    "api_url":          "https://7103.api.greenapi.com",
+    "recipient_phone":  "919510251732",
+    "on_insert_customer": True,
+    "on_delete":          True,
+    "on_soft_delete":     True,
+    "on_restore":         False,
+    "on_update":          False,
 }
 
 MYSQL_SETTINGS = {
@@ -113,14 +106,15 @@ STATE = {
         "total_restores": 0,
         "whatsapp_sent": 0,
         "whatsapp_failed": 0,
-        # per-table counters: { "db.table": {"insert":0,"update":0,"delete":0} }
+        "email_sent": 0,
+        "email_failed": 0,
         "per_table": {},
     },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
 
-_col_cache   = {}   # { "db.table": { "UNKNOWN_COL0": "real_name" } }
-_event_id    = 0    # auto-increment event ID
+_col_cache   = {}
+_event_id    = 0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -147,7 +141,6 @@ def resolve_columns(db: str, table: str, row: dict) -> dict:
     return {mapping.get(k, k): v for k, v in row.items()}
 
 def build_diff(before: dict, after: dict):
-    """Returns list of {field, before, after} for changed columns."""
     changes = []
     all_keys = set(list(before.keys()) + list(after.keys()))
     for k in all_keys:
@@ -184,20 +177,18 @@ def reset_daily_state():
             "total_inserts": 0, "total_updates": 0,
             "total_deletes": 0, "total_soft_deletes": 0,
             "total_restores": 0, "whatsapp_sent": 0,
-            "whatsapp_failed": 0, "per_table": {},
+            "whatsapp_failed": 0, "email_sent": 0,
+            "email_failed": 0, "per_table": {},
         }
         STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
         _event_id = 0
         print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
 
+
 # ─────────────────────────────────────────────────────────────
-#  WHATSAPP via CallMeBot (FREE)
+#  WHATSAPP via Green API
 # ─────────────────────────────────────────────────────────────
 def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
-    """
-    Send WhatsApp message via Green API.
-    Docs: https://green-api.com/en/docs/api/sending/SendMessage/
-    """
     if not WHATSAPP_CONFIG.get("enabled"):
         return
 
@@ -207,10 +198,9 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     recipient   = WHATSAPP_CONFIG.get("recipient_phone", "")
 
     if not all([id_instance, api_token, api_url, recipient]):
-        print("  ⚠  WhatsApp: Green API config incomplete in WHATSAPP_CONFIG")
+        print("  ⚠  WhatsApp: Green API config incomplete")
         return
 
-    # ── Build message ──────────────────────────────────────
     ICON_MAP = {
         "INSERT":      "🎉",
         "UPDATE":      "✏️",
@@ -230,7 +220,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
         f"*Event ID:* #{event_id}",
     ]
 
-    # Add key record fields (top 5 non-empty)
     if record:
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("*Record Details:*")
@@ -241,7 +230,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
                 lines.append(f"• {k}: {v_str}")
                 count += 1
 
-    # Add changes for UPDATE/SOFT_DELETE
     if diff:
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("*Changes:*")
@@ -256,9 +244,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     lines.append("_ADOPT Database Monitor_")
 
     message = "\n".join(lines)
-
-    # ── Send via Green API ─────────────────────────────────
-    # chatId format: {phone}@c.us  (e.g. "919876543210@c.us")
     chat_id = f"{recipient}@c.us"
     url = f"{api_url}/waInstance{id_instance}/sendMessage/{api_token}"
 
@@ -281,7 +266,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
 
 
 def should_send_whatsapp(event_type, table):
-    """Decide whether to send WhatsApp for this event."""
     cfg = WHATSAPP_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
@@ -297,10 +281,24 @@ def should_send_whatsapp(event_type, table):
 
 
 # ─────────────────────────────────────────────────────────────
-#  EMAIL
+#  EMAIL  — FIXED
+#  Root causes fixed:
+#    1. Was using hardcoded SMTP_SSL port 465 — now uses config port
+#    2. Tries STARTTLS (587) first, falls back to SSL (465)
+#    3. Full error message printed so you can see exactly what fails
 # ─────────────────────────────────────────────────────────────
 def send_email_notification(event_type, db, table, record_data, diff_data=None, meta=None):
-    if not EMAIL_CONFIG["enabled"]:
+    if not EMAIL_CONFIG.get("enabled"):
+        return
+
+    smtp_server   = EMAIL_CONFIG.get("smtp_server",     "smtp.gmail.com")
+    smtp_port     = EMAIL_CONFIG.get("smtp_port",       587)
+    sender_email  = EMAIL_CONFIG.get("sender_email",    "")
+    sender_pass   = EMAIL_CONFIG.get("sender_password", "")
+    recipient     = EMAIL_CONFIG.get("recipient_email", "")
+
+    if not all([sender_email, sender_pass, recipient]):
+        print("  ⚠  Email: config incomplete — check sender_email / sender_password / recipient_email")
         return
 
     COLOR_MAP = {
@@ -313,8 +311,8 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"{subject_label} — {db} / {table}"
-        msg["From"]    = EMAIL_CONFIG["sender_email"]
-        msg["To"]      = EMAIL_CONFIG["recipient_email"]
+        msg["From"]    = sender_email
+        msg["To"]      = recipient
 
         meta_html = ""
         if meta:
@@ -419,13 +417,62 @@ tr:nth-child(even) td{{background:#fafafa}}
 </div></body></html>"""
 
         msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
-            srv.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
-            srv.send_message(msg)
-        print(f"  ✉  Email sent [{event_type}] -> {db}.{table}")
+
+        # ── Try STARTTLS on port 587 first (most reliable for Gmail) ──
+        sent = False
+
+        if smtp_port == 587 or smtp_port == 465:
+            # Try the configured port first
+            try:
+                if smtp_port == 587:
+                    with smtplib.SMTP(smtp_server, 587, timeout=20) as srv:
+                        srv.ehlo()
+                        srv.starttls()
+                        srv.ehlo()
+                        srv.login(sender_email, sender_pass)
+                        srv.send_message(msg)
+                    sent = True
+                    print(f"  ✉  Email sent via STARTTLS:587 [{event_type}] -> {db}.{table}")
+                else:
+                    with smtplib.SMTP_SSL(smtp_server, 465, timeout=20) as srv:
+                        srv.login(sender_email, sender_pass)
+                        srv.send_message(msg)
+                    sent = True
+                    print(f"  ✉  Email sent via SSL:465 [{event_type}] -> {db}.{table}")
+            except Exception as primary_err:
+                print(f"  ⚠  Email primary attempt failed ({smtp_port}): {primary_err}")
+
+        # ── Fallback: try the OTHER port ──
+        if not sent:
+            fallback_port = 465 if smtp_port == 587 else 587
+            try:
+                if fallback_port == 587:
+                    with smtplib.SMTP(smtp_server, 587, timeout=20) as srv:
+                        srv.ehlo()
+                        srv.starttls()
+                        srv.ehlo()
+                        srv.login(sender_email, sender_pass)
+                        srv.send_message(msg)
+                    sent = True
+                    print(f"  ✉  Email sent via fallback STARTTLS:587 [{event_type}] -> {db}.{table}")
+                else:
+                    with smtplib.SMTP_SSL(smtp_server, 465, timeout=20) as srv:
+                        srv.login(sender_email, sender_pass)
+                        srv.send_message(msg)
+                    sent = True
+                    print(f"  ✉  Email sent via fallback SSL:465 [{event_type}] -> {db}.{table}")
+            except Exception as fallback_err:
+                print(f"  ✗  Email fallback also failed ({fallback_port}): {fallback_err}")
+
+        if sent:
+            STATE["stats"]["email_sent"] += 1
+        else:
+            STATE["stats"]["email_failed"] += 1
+            print(f"  ✗  Email FAILED for [{event_type}] {db}.{table} — both ports tried")
 
     except Exception as e:
-        print(f"  ✗  Email error: {e}")
+        STATE["stats"]["email_failed"] += 1
+        print(f"  ✗  Email build error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -457,7 +504,6 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     if len(STATE["events"]) > 5000:
         STATE["events"] = STATE["events"][:5000]
 
-    # Per-table stats
     tk = f"{db}.{table}"
     if tk not in STATE["stats"]["per_table"]:
         STATE["stats"]["per_table"][tk] = {"insert": 0, "update": 0, "delete": 0}
@@ -469,7 +515,6 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     elif etype_lower == "delete":
         STATE["stats"]["per_table"][tk]["delete"] += 1
 
-    # Global stats
     cmap = {
         "INSERT": "total_inserts", "UPDATE": "total_updates",
         "DELETE": "total_deletes", "SOFT_DELETE": "total_soft_deletes",
@@ -478,7 +523,6 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     if event_type in cmap:
         STATE["stats"][cmap[event_type]] += 1
 
-    # Customer count
     if table in CUSTOMER_TABLES and db in STATE["customer_counts"]:
         if event_type == "INSERT":
             STATE["customer_counts"][db] += 1
@@ -488,9 +532,9 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     STATE["last_event"] = now_str()
 
     # ── Email notification ─────────────────────────────────
-    is_customer = table in CUSTOMER_TABLES
+    is_customer  = table in CUSTOMER_TABLES
     should_email = (event_type == "INSERT" and is_customer) or event_type == "DELETE"
-    if should_email and EMAIL_CONFIG["enabled"]:
+    if should_email and EMAIL_CONFIG.get("enabled"):
         threading.Thread(
             target=send_email_notification,
             args=(event_type, db, table, record or {}, diff, meta),
@@ -577,20 +621,35 @@ def check_binlog_status():
         print(f"  ✗  Cannot connect: {e}")
     print("="*70 + "\n")
 
-    # Print WhatsApp config status
+    # Email config status
+    print("="*70)
+    print("  EMAIL STATUS")
+    print("="*70)
+    em = EMAIL_CONFIG
+    if not em.get("enabled"):
+        print("  ✗  Email DISABLED")
+    else:
+        print(f"  ✔  SMTP: {em.get('smtp_server')}:{em.get('smtp_port')}")
+        print(f"  ✔  From: {em.get('sender_email')}")
+        print(f"  ✔  To:   {em.get('recipient_email')}")
+        pw = em.get("sender_password","")
+        if len(pw) == 16 and " " not in pw:
+            print(f"  ✔  Password: looks like a valid Gmail App Password (16 chars)")
+        else:
+            print(f"  ⚠  Password: {len(pw)} chars — Gmail App Passwords must be exactly 16 chars, no spaces")
+    print("="*70 + "\n")
+
+    # WhatsApp config status
     print("="*70)
     print("  WHATSAPP (Green API) STATUS")
     print("="*70)
     wa = WHATSAPP_CONFIG
     if not wa.get("enabled"):
-        print("  ✗  WhatsApp is DISABLED (set enabled=True in WHATSAPP_CONFIG)")
-    elif not wa.get("api_token"):
-        print("  ⚠  WhatsApp enabled but api_token not set!")
+        print("  ✗  WhatsApp DISABLED")
     else:
         print(f"  ✔  Green API instance: {wa.get('id_instance')}")
         print(f"  ✔  Recipient: {wa.get('recipient_phone')}")
         print(f"  ✔  Alerts: INSERT_CUSTOMER={wa.get('on_insert_customer')} | DELETE={wa.get('on_delete')} | SOFT_DELETE={wa.get('on_soft_delete')}")
-        print(f"  ⚠  Make sure instance is AUTHORIZED (green status in dashboard)!")
     print("="*70 + "\n")
 
 
@@ -632,7 +691,6 @@ def binlog_monitor():
 
                 STATE["binlog_position"] = binlog_event.packet.log_pos
 
-                # ── INSERT ──────────────────────────────────
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
@@ -640,7 +698,6 @@ def binlog_monitor():
                         print(f"  [INSERT] {db}.{table}")
                         push_event("INSERT", db, table, detail, record=values)
 
-                # ── DELETE ──────────────────────────────────
                 elif isinstance(binlog_event, DeleteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
@@ -648,7 +705,6 @@ def binlog_monitor():
                         print(f"  [DELETE] {db}.{table}")
                         push_event("DELETE", db, table, detail, record=values)
 
-                # ── UPDATE ──────────────────────────────────
                 elif isinstance(binlog_event, UpdateRowsEvent):
                     for row in binlog_event.rows:
                         before = resolve_columns(db, table, row["before_values"])
@@ -733,7 +789,9 @@ def api_stats():
         "ready":              STATE["ready"],
         "databases":          len(WATCH_DATABASES),
         "last_event":         STATE["last_event"],
-        "email_enabled":      EMAIL_CONFIG["enabled"],
+        "email_enabled":      EMAIL_CONFIG.get("enabled"),
+        "email_sent":         STATE["stats"]["email_sent"],
+        "email_failed":       STATE["stats"]["email_failed"],
         "whatsapp_enabled":   WHATSAPP_CONFIG.get("enabled", False),
         "whatsapp_sent":      STATE["stats"]["whatsapp_sent"],
         "whatsapp_failed":    STATE["stats"]["whatsapp_failed"],
@@ -845,6 +903,7 @@ header{display:flex;align-items:center;justify-content:space-between;
 .metric-val{font-size:22px;font-weight:700;font-family:'Syne',sans-serif}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
+.c-em{color:#f59e0b}
 .tabs-bar{display:flex;gap:0;padding:0 24px;border-bottom:1px solid var(--border);
           overflow-x:auto;background:var(--surf)}
 .tab{padding:10px 16px;font-size:11px;cursor:pointer;color:var(--muted);
@@ -945,7 +1004,6 @@ header{display:flex;align-items:center;justify-content:space-between;
 .rec-table td:last-child{color:#fff;word-break:break-word}
 .footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);
             border-top:1px solid var(--border);display:flex;justify-content:space-between}
-/* WhatsApp status panel */
 .wa-panel{margin:0 24px 16px;background:var(--surf);border:1px solid #25d36644;
           border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .wa-icon{font-size:24px}
@@ -994,13 +1052,13 @@ header{display:flex;align-items:center;justify-content:space-between;
     <div class="metric"><div class="metric-label">Soft Deletes</div><div class="metric-val c-soft" id="m-soft">0</div></div>
     <div class="metric"><div class="metric-label">Restores</div><div class="metric-val c-rest" id="m-rest">0</div></div>
     <div class="metric"><div class="metric-label">📱 WA Sent</div><div class="metric-val c-wa" id="m-wa">0</div></div>
+    <div class="metric"><div class="metric-label">📧 Email Sent</div><div class="metric-val c-em" id="m-email">0</div></div>
   </div>
 
-  <!-- WhatsApp status panel -->
   <div class="wa-panel" id="wa-panel">
     <div class="wa-icon">📱</div>
     <div class="wa-info">
-      <div class="wa-title">WhatsApp Notifications (CallMeBot)</div>
+      <div class="wa-title">WhatsApp Notifications (Green API)</div>
       <div class="wa-sub" id="wa-status-text">Checking status...</div>
     </div>
     <div class="wa-stats">
@@ -1219,11 +1277,12 @@ async function load(){
     document.getElementById('m-soft').textContent  = s.total_soft_deletes;
     document.getElementById('m-rest').textContent  = s.total_restores;
     document.getElementById('m-wa').textContent    = s.whatsapp_sent || 0;
+    document.getElementById('m-email').textContent = s.email_sent || 0;
     document.getElementById('wa-sent-big').textContent = s.whatsapp_sent || 0;
     document.getElementById('wa-fail-big').textContent = s.whatsapp_failed || 0;
     document.getElementById('wa-status-text').textContent = s.whatsapp_enabled
       ? `Active — Sending alerts for: INSERT (customer), DELETE, SOFT DELETE`
-      : `Disabled — Set enabled=True in WHATSAPP_CONFIG to activate`;
+      : `Disabled`;
     if(s.last_event) document.getElementById('last-event').textContent = 'Last event: '+s.last_event;
     const counts = await fetch('/api/counts').then(r=>r.json());
     const tabsBar = document.getElementById('tabs-bar');
@@ -1282,6 +1341,4 @@ if __name__ == "__main__":
     threading.Thread(target=binlog_monitor, daemon=True).start()
     threading.Thread(target=reset_daily_state, daemon=True).start()
     print("\nDashboard: http://0.0.0.0:5000\n")
-
-
-
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
