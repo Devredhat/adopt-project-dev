@@ -39,12 +39,10 @@ app = Flask(__name__)
 #  CONFIG
 # ─────────────────────────────────────────────────────────────
 EMAIL_CONFIG = {
-    "enabled":         True,
-    "smtp_server":     "smtp.gmail.com",
-    "smtp_port":       587,          # 587 = STARTTLS  |  465 = SSL
-    "sender_email":    "mbsuthar32@gmail.com",
-    "sender_password": "dryfbgqdixyuqprf",   # Gmail App Password (16 chars, no spaces)
-    "recipient_email": "mbsuthar32@gmail.com",
+    "enabled":   True,
+    "api_key":   "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",  # your Resend API key
+    "from_email": "onboarding@resend.dev",        # use this until you verify a domain
+    "to_email":  "mbsuthar32@gmail.com",
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -291,188 +289,94 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     if not EMAIL_CONFIG.get("enabled"):
         return
 
-    smtp_server   = EMAIL_CONFIG.get("smtp_server",     "smtp.gmail.com")
-    smtp_port     = EMAIL_CONFIG.get("smtp_port",       587)
-    sender_email  = EMAIL_CONFIG.get("sender_email",    "")
-    sender_pass   = EMAIL_CONFIG.get("sender_password", "")
-    recipient     = EMAIL_CONFIG.get("recipient_email", "")
+    api_key    = EMAIL_CONFIG.get("api_key", "")
+    from_email = EMAIL_CONFIG.get("from_email", "")
+    to_email   = EMAIL_CONFIG.get("to_email", "")
 
-    if not all([sender_email, sender_pass, recipient]):
-        print("  ⚠  Email: config incomplete — check sender_email / sender_password / recipient_email")
+    if not all([api_key, from_email, to_email]):
+        print("  ⚠  Email: config incomplete")
         return
 
+    meta = meta or {}
     COLOR_MAP = {
         "INSERT": ("#1b5e20", "#e8f5e9", "🎉 New Record Inserted"),
         "DELETE": ("#b71c1c", "#ffebee", "🗑️ Record Permanently Deleted"),
     }
     accent, bg, subject_label = COLOR_MAP.get(event_type, ("#333", "#fff", "DB Event"))
-    meta = meta or {}
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"{subject_label} — {db} / {table}"
-        msg["From"]    = sender_email
-        msg["To"]      = recipient
+    # Build rows HTML
+    rows_html = ""
+    if record_data:
+        for key, value in record_data.items():
+            if value is not None:
+                rows_html += f"<tr><td><strong>{key}</strong></td><td>{fmt_val(value)}</td></tr>"
 
-        meta_html = ""
-        if meta:
-            meta_rows = ""
-            for k, v in meta.items():
-                if v:
-                    meta_rows += f"<tr><td style='color:#777;font-size:11px;padding:6px 10px'>{k}</td><td style='font-size:12px;padding:6px 10px'>{v}</td></tr>"
-            if meta_rows:
-                meta_html = f"""
-                <h3 style="color:#555;margin:20px 0 8px;font-size:13px;border-bottom:1px solid #eee;padding-bottom:6px">
-                  ⚙️ Event Metadata
-                </h3>
-                <table style="width:100%;border-collapse:collapse;background:#f9f9f9;border-radius:6px;overflow:hidden">
-                  {meta_rows}
-                </table>"""
-
-        rows_html = ""
-        if record_data:
-            for key, value in record_data.items():
-                if value is not None:
-                    rows_html += f"<tr><td><strong>{key}</strong></td><td>{fmt_val(value)}</td></tr>"
-
-        diff_html = ""
-        if diff_data:
-            diff_rows = ""
-            for d in diff_data:
-                diff_rows += f"""<tr>
-                  <td style='font-weight:700;padding:8px 10px'>{d['field']}</td>
-                  <td style='background:#fff3f3;color:#c62828;padding:8px 10px'>{d['before'] or '—'}</td>
-                  <td style='background:#f3fff3;color:#2e7d32;padding:8px 10px'>{d['after'] or '—'}</td>
-                </tr>"""
-            if diff_rows:
-                diff_html = f"""
-                <h3 style="color:#555;margin:20px 0 8px;font-size:13px;border-bottom:1px solid #eee;padding-bottom:6px">
-                  🔄 Changes (Before → After)
-                </h3>
-                <table style="width:100%;border-collapse:collapse">
-                  <thead><tr>
-                    <th style="background:#555;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Field</th>
-                    <th style="background:#c62828;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Before</th>
-                    <th style="background:#2e7d32;color:#fff;padding:8px 10px;text-align:left;font-size:11px">After</th>
-                  </tr></thead>
-                  <tbody>{diff_rows}</tbody>
-                </table>"""
-
-        del_box = ""
-        if event_type == "DELETE":
-            del_box = """
-            <div style="background:#fff5f5;border:2px dashed #f43f5e;border-radius:8px;
-                        padding:16px;text-align:center;margin:16px 0">
-              <div style="font-size:32px">⚠️</div>
-              <div style="font-size:14px;font-weight:700;color:#b71c1c;margin-top:6px">
-                PERMANENTLY DELETED — Cannot be undone
-              </div>
-            </div>"""
-
-        table_section = ""
-        if rows_html:
-            table_section = f"""
-            <h3 style="color:#555;margin:20px 0 8px;font-size:13px;border-bottom:1px solid #eee;padding-bottom:6px">
-              📋 Record Details
-            </h3>
+    diff_html = ""
+    if diff_data:
+        diff_rows = ""
+        for d in diff_data:
+            diff_rows += f"""<tr>
+              <td style='font-weight:700;padding:8px 10px'>{d['field']}</td>
+              <td style='background:#fff3f3;color:#c62828;padding:8px 10px'>{d['before'] or '—'}</td>
+              <td style='background:#f3fff3;color:#2e7d32;padding:8px 10px'>{d['after'] or '—'}</td>
+            </tr>"""
+        if diff_rows:
+            diff_html = f"""<h3 style="color:#555;margin:20px 0 8px;font-size:13px">🔄 Changes (Before → After)</h3>
             <table style="width:100%;border-collapse:collapse">
               <thead><tr>
-                <th style="background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px">Field</th>
-                <th style="background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px">Value</th>
+                <th style="background:#555;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Field</th>
+                <th style="background:#c62828;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Before</th>
+                <th style="background:#2e7d32;color:#fff;padding:8px 10px;text-align:left;font-size:11px">After</th>
               </tr></thead>
-              <tbody>{rows_html}</tbody>
+              <tbody>{diff_rows}</tbody>
             </table>"""
 
-        html = f"""<!DOCTYPE html><html><head><style>
-body{{font-family:'Segoe UI',Arial,sans-serif;background:#f0f2f5;margin:0;padding:20px}}
-.wrap{{max-width:650px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.12)}}
-.hdr{{background:{accent};color:#fff;padding:24px 28px;text-align:center}}
-.hdr h1{{margin:0;font-size:22px}}.hdr p{{margin:6px 0 0;opacity:.85;font-size:12px}}
-.body{{padding:24px 28px}}
-.ts{{background:{bg};border-left:4px solid {accent};padding:10px 14px;border-radius:4px;margin-bottom:16px;font-size:12px}}
-.ib{{background:#f8f9fa;border-left:4px solid {accent};padding:10px 14px;margin-bottom:10px;border-radius:4px}}
-.il{{color:#888;font-size:10px;text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px}}
-.iv{{color:#111;font-size:14px;font-weight:700}}
-td{{padding:8px 12px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#333;vertical-align:top}}
-tr:nth-child(even) td{{background:#fafafa}}
-.ftr{{background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee}}
-</style></head><body><div class="wrap">
-<div class="hdr">
-  <h1>{subject_label}</h1>
-  <p>ADOPT Database Monitor — Automated Alert</p>
-</div>
-<div class="body">
-  <div class="ts"><strong>Detected at:</strong> {now_str()}</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px">
-    <div class="ib"><div class="il">Event</div><div class="iv">{event_type}</div></div>
-    <div class="ib"><div class="il">Database</div><div class="iv" style="font-size:11px">{db}</div></div>
-    <div class="ib"><div class="il">Table</div><div class="iv">{table}</div></div>
-  </div>
-  {del_box}
-  {meta_html}
-  {diff_html}
-  {table_section}
-</div>
-<div class="ftr">ADOPT Database Monitor v2 — Do not reply · Event #{meta.get('Event ID','')}</div>
-</div></body></html>"""
+    html_body = f"""<html><body style="font-family:Arial,sans-serif;background:#f0f2f5;padding:20px">
+    <div style="max-width:650px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.12)">
+      <div style="background:{accent};color:#fff;padding:24px 28px;text-align:center">
+        <h1 style="margin:0;font-size:22px">{subject_label}</h1>
+        <p style="margin:6px 0 0;opacity:.85;font-size:12px">ADOPT Database Monitor — Automated Alert</p>
+      </div>
+      <div style="padding:24px 28px">
+        <p style="background:{bg};border-left:4px solid {accent};padding:10px 14px;font-size:12px">
+          <strong>Detected at:</strong> {now_str()} &nbsp;|&nbsp;
+          <strong>Event:</strong> {event_type} &nbsp;|&nbsp;
+          <strong>DB:</strong> {db} &nbsp;|&nbsp;
+          <strong>Table:</strong> {table}
+        </p>
+        {diff_html}
+        {"<h3 style='color:#555;margin:20px 0 8px;font-size:13px'>📋 Record Details</h3><table style='width:100%;border-collapse:collapse'><thead><tr><th style='background:" + accent + ";color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Field</th><th style='background:" + accent + ";color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Value</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if rows_html else ""}
+      </div>
+      <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
+        ADOPT Database Monitor v2 — Event #{meta.get('Event ID','')}
+      </div>
+    </div>
+    </body></html>"""
 
-        msg.attach(MIMEText(html, "html"))
-
-        # ── Try STARTTLS on port 587 first (most reliable for Gmail) ──
-        sent = False
-
-        if smtp_port == 587 or smtp_port == 465:
-            # Try the configured port first
-            try:
-                if smtp_port == 587:
-                    with smtplib.SMTP(smtp_server, 587, timeout=20) as srv:
-                        srv.ehlo()
-                        srv.starttls()
-                        srv.ehlo()
-                        srv.login(sender_email, sender_pass)
-                        srv.send_message(msg)
-                    sent = True
-                    print(f"  ✉  Email sent via STARTTLS:587 [{event_type}] -> {db}.{table}")
-                else:
-                    with smtplib.SMTP_SSL(smtp_server, 465, timeout=20) as srv:
-                        srv.login(sender_email, sender_pass)
-                        srv.send_message(msg)
-                    sent = True
-                    print(f"  ✉  Email sent via SSL:465 [{event_type}] -> {db}.{table}")
-            except Exception as primary_err:
-                print(f"  ⚠  Email primary attempt failed ({smtp_port}): {primary_err}")
-
-        # ── Fallback: try the OTHER port ──
-        if not sent:
-            fallback_port = 465 if smtp_port == 587 else 587
-            try:
-                if fallback_port == 587:
-                    with smtplib.SMTP(smtp_server, 587, timeout=20) as srv:
-                        srv.ehlo()
-                        srv.starttls()
-                        srv.ehlo()
-                        srv.login(sender_email, sender_pass)
-                        srv.send_message(msg)
-                    sent = True
-                    print(f"  ✉  Email sent via fallback STARTTLS:587 [{event_type}] -> {db}.{table}")
-                else:
-                    with smtplib.SMTP_SSL(smtp_server, 465, timeout=20) as srv:
-                        srv.login(sender_email, sender_pass)
-                        srv.send_message(msg)
-                    sent = True
-                    print(f"  ✉  Email sent via fallback SSL:465 [{event_type}] -> {db}.{table}")
-            except Exception as fallback_err:
-                print(f"  ✗  Email fallback also failed ({fallback_port}): {fallback_err}")
-
-        if sent:
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": from_email,
+                "to": [to_email],
+                "subject": f"{subject_label} — {db} / {table}",
+                "html": html_body,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
             STATE["stats"]["email_sent"] += 1
+            print(f"  ✉  Email sent via Resend [{event_type}] -> {db}.{table}")
         else:
             STATE["stats"]["email_failed"] += 1
-            print(f"  ✗  Email FAILED for [{event_type}] {db}.{table} — both ports tried")
-
+            print(f"  ✗  Email failed [{resp.status_code}]: {resp.text[:200]}")
     except Exception as e:
         STATE["stats"]["email_failed"] += 1
-        print(f"  ✗  Email build error: {e}")
+        print(f"  ✗  Email error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
