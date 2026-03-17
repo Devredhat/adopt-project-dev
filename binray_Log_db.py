@@ -12,6 +12,7 @@
 #   ✔ Event detail popup on click
 #   ✔ Uptime + connection status
 #   ✔ WhatsApp notifications via Green API
+#   ✔ Email via Resend API (works on Render — no SMTP)
 #
 # REQUIREMENTS:
 #   pip install flask pymysql mysql-replication requests
@@ -25,9 +26,6 @@ import csv
 import io
 import requests
 from datetime import datetime
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
@@ -39,21 +37,21 @@ app = Flask(__name__)
 #  CONFIG
 # ─────────────────────────────────────────────────────────────
 EMAIL_CONFIG = {
-    "enabled":   True,
-    "api_key":   "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",  # your Resend API key
-    "from_email": "onboarding@resend.dev",        # use this until you verify a domain
-    "to_email":  "mbsuthar32@gmail.com",
+    "enabled":    True,
+    "api_key":    "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",
+    "from_email": "onboarding@resend.dev",
+    "to_email":   "mbsuthar32@gmail.com",
 }
 
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP CONFIG (Green API)
 # ─────────────────────────────────────────────────────────────
 WHATSAPP_CONFIG = {
-    "enabled":          True,
-    "id_instance":      "7103531926",
-    "api_token":        "8577c63fab924f8a8b8eacefb44a8fae701a844527f84e22b4",
-    "api_url":          "https://7103.api.greenapi.com",
-    "recipient_phone":  "919510251732",
+    "enabled":            True,
+    "id_instance":        "7103531926",
+    "api_token":          "8577c63fab924f8a8b8eacefb44a8fae701a844527f84e22b4",
+    "api_url":            "https://7103.api.greenapi.com",
+    "recipient_phone":    "919510251732",
     "on_insert_customer": True,
     "on_delete":          True,
     "on_soft_delete":     True,
@@ -97,22 +95,22 @@ STATE = {
     "mysql_user":      MYSQL_SETTINGS["user"],
     "mysql_host":      MYSQL_SETTINGS["host"],
     "stats": {
-        "total_inserts": 0,
-        "total_updates": 0,
-        "total_deletes": 0,
+        "total_inserts":    0,
+        "total_updates":    0,
+        "total_deletes":    0,
         "total_soft_deletes": 0,
-        "total_restores": 0,
-        "whatsapp_sent": 0,
-        "whatsapp_failed": 0,
-        "email_sent": 0,
-        "email_failed": 0,
-        "per_table": {},
+        "total_restores":   0,
+        "whatsapp_sent":    0,
+        "whatsapp_failed":  0,
+        "email_sent":       0,
+        "email_failed":     0,
+        "per_table":        {},
     },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
 
-_col_cache   = {}
-_event_id    = 0
+_col_cache = {}
+_event_id  = 0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,6 +155,7 @@ def uptime_str():
         return f"{h}h {m}m {s}s"
     except:
         return "—"
+
 
 # ── DAILY RESET ──────────────────────────────────────────────
 def reset_daily_state():
@@ -279,11 +278,7 @@ def should_send_whatsapp(event_type, table):
 
 
 # ─────────────────────────────────────────────────────────────
-#  EMAIL  — FIXED
-#  Root causes fixed:
-#    1. Was using hardcoded SMTP_SSL port 465 — now uses config port
-#    2. Tries STARTTLS (587) first, falls back to SSL (465)
-#    3. Full error message printed so you can see exactly what fails
+#  EMAIL via Resend API (HTTPS — works on Render)
 # ─────────────────────────────────────────────────────────────
 def send_email_notification(event_type, db, table, record_data, diff_data=None, meta=None):
     if not EMAIL_CONFIG.get("enabled"):
@@ -304,13 +299,14 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     }
     accent, bg, subject_label = COLOR_MAP.get(event_type, ("#333", "#fff", "DB Event"))
 
-    # Build rows HTML
+    # Build record rows HTML
     rows_html = ""
     if record_data:
         for key, value in record_data.items():
             if value is not None:
                 rows_html += f"<tr><td><strong>{key}</strong></td><td>{fmt_val(value)}</td></tr>"
 
+    # Build diff HTML
     diff_html = ""
     if diff_data:
         diff_rows = ""
@@ -331,6 +327,18 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
               <tbody>{diff_rows}</tbody>
             </table>"""
 
+    record_section = ""
+    if rows_html:
+        record_section = (
+            "<h3 style='color:#555;margin:20px 0 8px;font-size:13px'>📋 Record Details</h3>"
+            "<table style='width:100%;border-collapse:collapse'>"
+            "<thead><tr>"
+            f"<th style='background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Field</th>"
+            f"<th style='background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Value</th>"
+            "</tr></thead>"
+            f"<tbody>{rows_html}</tbody></table>"
+        )
+
     html_body = f"""<html><body style="font-family:Arial,sans-serif;background:#f0f2f5;padding:20px">
     <div style="max-width:650px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.12)">
       <div style="background:{accent};color:#fff;padding:24px 28px;text-align:center">
@@ -345,10 +353,10 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
           <strong>Table:</strong> {table}
         </p>
         {diff_html}
-        {"<h3 style='color:#555;margin:20px 0 8px;font-size:13px'>📋 Record Details</h3><table style='width:100%;border-collapse:collapse'><thead><tr><th style='background:" + accent + ";color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Field</th><th style='background:" + accent + ";color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Value</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if rows_html else ""}
+        {record_section}
       </div>
       <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
-        ADOPT Database Monitor v2 — Event #{meta.get('Event ID','')}
+        ADOPT Database Monitor v2 — Event #{meta.get('Event ID', '')}
       </div>
     </div>
     </body></html>"""
@@ -361,10 +369,10 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
                 "Content-Type": "application/json",
             },
             json={
-                "from": from_email,
-                "to": [to_email],
+                "from":    from_email,
+                "to":      [to_email],
                 "subject": f"{subject_label} — {db} / {table}",
-                "html": html_body,
+                "html":    html_body,
             },
             timeout=15,
         )
@@ -386,12 +394,12 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     global _event_id
     _event_id += 1
     meta = meta or {}
-    meta["Event ID"] = str(_event_id)
-    meta["Binlog File"] = STATE["binlog_file"]
+    meta["Event ID"]        = str(_event_id)
+    meta["Binlog File"]     = STATE["binlog_file"]
     meta["Binlog Position"] = str(STATE["binlog_position"])
-    meta["MySQL User"] = STATE["mysql_user"]
-    meta["MySQL Host"] = STATE["mysql_host"]
-    meta["Detected At"] = now_str()
+    meta["MySQL User"]      = STATE["mysql_user"]
+    meta["MySQL Host"]      = STATE["mysql_host"]
+    meta["Detected At"]     = now_str()
 
     ev = {
         "id":      _event_id,
@@ -412,7 +420,7 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     if tk not in STATE["stats"]["per_table"]:
         STATE["stats"]["per_table"][tk] = {"insert": 0, "update": 0, "delete": 0}
     etype_lower = event_type.lower()
-    if etype_lower in ("insert",):
+    if etype_lower == "insert":
         STATE["stats"]["per_table"][tk]["insert"] += 1
     elif etype_lower in ("update", "soft_delete", "restore"):
         STATE["stats"]["per_table"][tk]["update"] += 1
@@ -420,9 +428,11 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         STATE["stats"]["per_table"][tk]["delete"] += 1
 
     cmap = {
-        "INSERT": "total_inserts", "UPDATE": "total_updates",
-        "DELETE": "total_deletes", "SOFT_DELETE": "total_soft_deletes",
-        "RESTORE": "total_restores",
+        "INSERT":      "total_inserts",
+        "UPDATE":      "total_updates",
+        "DELETE":      "total_deletes",
+        "SOFT_DELETE": "total_soft_deletes",
+        "RESTORE":     "total_restores",
     }
     if event_type in cmap:
         STATE["stats"][cmap[event_type]] += 1
@@ -533,14 +543,11 @@ def check_binlog_status():
     if not em.get("enabled"):
         print("  ✗  Email DISABLED")
     else:
-        print(f"  ✔  SMTP: {em.get('smtp_server')}:{em.get('smtp_port')}")
-        print(f"  ✔  From: {em.get('sender_email')}")
-        print(f"  ✔  To:   {em.get('recipient_email')}")
-        pw = em.get("sender_password","")
-        if len(pw) == 16 and " " not in pw:
-            print(f"  ✔  Password: looks like a valid Gmail App Password (16 chars)")
-        else:
-            print(f"  ⚠  Password: {len(pw)} chars — Gmail App Passwords must be exactly 16 chars, no spaces")
+        print(f"  ✔  Provider: Resend API (HTTPS — works on Render)")
+        print(f"  ✔  From: {em.get('from_email')}")
+        print(f"  ✔  To:   {em.get('to_email')}")
+        key = em.get("api_key", "")
+        print(f"  ✔  API Key: {key[:8]}...{key[-4:] if len(key) > 12 else '(too short?)'}")
     print("="*70 + "\n")
 
     # WhatsApp config status
@@ -569,14 +576,14 @@ def binlog_monitor():
         stream = None
         try:
             stream = BinLogStreamReader(
-                connection_settings    = MYSQL_SETTINGS,
-                ctl_connection_settings= MYSQL_SETTINGS,
-                server_id              = 100,
-                only_events            = [WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, RotateEvent],
-                only_schemas           = list(WATCH_DATABASES),
-                resume_stream          = True,
-                blocking               = True,
-                freeze_schema          = False,
+                connection_settings     = MYSQL_SETTINGS,
+                ctl_connection_settings = MYSQL_SETTINGS,
+                server_id               = 100,
+                only_events             = [WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, RotateEvent],
+                only_schemas            = list(WATCH_DATABASES),
+                resume_stream           = True,
+                blocking                = True,
+                freeze_schema           = False,
             )
             print("  ✔  Connected to binlog stream\n")
             STATE["ready"] = True
@@ -630,7 +637,9 @@ def binlog_monitor():
 
                         else:
                             if diff:
-                                detail = "Changed: " + " | ".join(f"{d['field']}: {d['before']} → {d['after']}" for d in diff)
+                                detail = "Changed: " + " | ".join(
+                                    f"{d['field']}: {d['before']} → {d['after']}" for d in diff
+                                )
                             else:
                                 detail = "No column changes"
                             print(f"  [UPDATE] {db}.{table}")
@@ -652,11 +661,11 @@ def binlog_monitor():
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/events")
 def api_events():
-    limit   = int(freq.args.get("limit",  100))
-    offset  = int(freq.args.get("offset",   0))
-    db_f    = freq.args.get("db",    "").strip().lower()
-    ev_f    = freq.args.get("event", "").strip().upper()
-    search  = freq.args.get("search","").strip().lower()
+    limit  = int(freq.args.get("limit",  100))
+    offset = int(freq.args.get("offset",   0))
+    db_f   = freq.args.get("db",    "").strip().lower()
+    ev_f   = freq.args.get("event", "").strip().upper()
+    search = freq.args.get("search","").strip().lower()
 
     evs = STATE["events"]
     if db_f:
@@ -669,8 +678,8 @@ def api_events():
                search in e["table"].lower() or
                search in e["details"].lower()]
 
-    total  = len(evs)
-    paged  = evs[offset: offset + limit]
+    total = len(evs)
+    paged = evs[offset: offset + limit]
     return jsonify({"events": paged, "total": total, "offset": offset, "limit": limit})
 
 
@@ -690,22 +699,22 @@ def api_counts():
 @app.route("/api/stats")
 def api_stats():
     return jsonify({
-        "ready":              STATE["ready"],
-        "databases":          len(WATCH_DATABASES),
-        "last_event":         STATE["last_event"],
-        "email_enabled":      EMAIL_CONFIG.get("enabled"),
-        "email_sent":         STATE["stats"]["email_sent"],
-        "email_failed":       STATE["stats"]["email_failed"],
-        "whatsapp_enabled":   WHATSAPP_CONFIG.get("enabled", False),
-        "whatsapp_sent":      STATE["stats"]["whatsapp_sent"],
-        "whatsapp_failed":    STATE["stats"]["whatsapp_failed"],
-        "total_events":       len(STATE["events"]),
-        "binlog_file":        STATE["binlog_file"],
-        "binlog_position":    STATE["binlog_position"],
-        "mysql_user":         STATE["mysql_user"],
-        "mysql_host":         STATE["mysql_host"],
-        "uptime":             uptime_str(),
-        "start_time":         STATE["start_time"],
+        "ready":            STATE["ready"],
+        "databases":        len(WATCH_DATABASES),
+        "last_event":       STATE["last_event"],
+        "email_enabled":    EMAIL_CONFIG.get("enabled"),
+        "email_sent":       STATE["stats"]["email_sent"],
+        "email_failed":     STATE["stats"]["email_failed"],
+        "whatsapp_enabled": WHATSAPP_CONFIG.get("enabled", False),
+        "whatsapp_sent":    STATE["stats"]["whatsapp_sent"],
+        "whatsapp_failed":  STATE["stats"]["whatsapp_failed"],
+        "total_events":     len(STATE["events"]),
+        "binlog_file":      STATE["binlog_file"],
+        "binlog_position":  STATE["binlog_position"],
+        "mysql_user":       STATE["mysql_user"],
+        "mysql_host":       STATE["mysql_host"],
+        "uptime":           uptime_str(),
+        "start_time":       STATE["start_time"],
         **STATE["stats"],
     })
 
@@ -724,15 +733,15 @@ def api_table_stats():
 @app.route("/api/export/csv")
 def api_export_csv():
     from flask import Response
-    db_f   = freq.args.get("db","").strip().lower()
-    ev_f   = freq.args.get("event","").strip().upper()
+    db_f   = freq.args.get("db",    "").strip().lower()
+    ev_f   = freq.args.get("event", "").strip().upper()
     search = freq.args.get("search","").strip().lower()
 
     evs = STATE["events"]
-    if db_f:    evs = [e for e in evs if e["db"] == db_f]
+    if db_f:  evs = [e for e in evs if e["db"] == db_f]
     if ev_f and ev_f != "ALL": evs = [e for e in evs if e["event"] == ev_f]
-    if search:  evs = [e for e in evs if search in e["db"].lower() or
-                       search in e["table"].lower() or search in e["details"].lower()]
+    if search: evs = [e for e in evs if search in e["db"].lower() or
+                      search in e["table"].lower() or search in e["details"].lower()]
 
     output = io.StringIO()
     writer = csv.writer(output)
