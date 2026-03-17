@@ -36,12 +36,19 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────────────────────
+# Replace your EMAIL_CONFIG with this:
 EMAIL_CONFIG = {
     "enabled":    True,
     "api_key":    "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",
     "from_email": "onboarding@resend.dev",
-    "to_email":   "mbsuthar32@gmail.com",
+    "to_email":   "1pyhsoy2i@mozmail.com",  # ← Your Firefox Relay mask
+    # Use ANY mask you create - they all work!
 }
+
+# Optional: Create multiple masks for different purposes
+# alert@mozmail.com - for urgent alerts
+# logs@mozmail.com - for daily logs  
+# monitor@mozmail.com - for system monitoring
 
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP CONFIG (Green API)
