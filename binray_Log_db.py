@@ -41,7 +41,7 @@ EMAIL_CONFIG = {
     "enabled":    True,
     "api_key":    "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",
     "from_email": "onboarding@resend.dev",
-    "to_email":   "ttqirq00f@mozmail.com",  # ← Your Firefox Relay mask
+    "to_email":   "mbsuthar32@gmail.com",  # ← Your Firefox Relay mask
     # Use ANY mask you create - they all work!
 }
 
