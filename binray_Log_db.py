@@ -49,8 +49,8 @@ EMAIL_CONFIG = {
 # ─────────────────────────────────────────────────────────────
 SLACK_CONFIG = {
     "enabled":            True,
-    "bot_token":          "xoxe.xoxp-1-Mi0yLTk5ODI1NTg2NDDYzNTQtOTk5NTQ3MjM0NjI3My0xMDczMzY1MTIwODMwNi0xMDc2MTkyMjk0MzgwOC1lN2FjOTVlZjliZjgxMDI0MDhmZDgxMjQwYjQ4Y2FhMGMzNmZjNTlmZTk5ODE4YmZkOWQxMjEwNmRkZjA2ZmI1",
-    "channel":            "#db-alerts",           # ← change to your channel, e.g. "#general" or "C0XXXXXXX"
+    "bot_token":          "xoxb-9982558646354-10727308612931-ZJX4mbArZbiVJctSwE17dmm0",
+    "channel":            "#db-alerts",
     "on_insert_customer": True,
     "on_delete":          True,
     "on_soft_delete":     True,
