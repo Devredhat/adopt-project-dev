@@ -25,6 +25,7 @@ import threading
 import time
 import csv
 import io
+import os
 import requests
 from datetime import datetime
 
@@ -44,9 +45,6 @@ EMAIL_CONFIG = {
     "to_email":   "mbsuthar32@gmail.com",
 }
 
-# ─────────────────────────────────────────────────────────────
-#  SLACK CONFIG
-# ─────────────────────────────────────────────────────────────
 SLACK_CONFIG = {
     "enabled":            True,
     "bot_token":          "xoxb-9982558646354-10727308612931-ZJX4mbArZbiVJctSwE17dmm0",
@@ -58,9 +56,6 @@ SLACK_CONFIG = {
     "on_update":          False,
 }
 
-# ─────────────────────────────────────────────────────────────
-#  WHATSAPP CONFIG (Green API)
-# ─────────────────────────────────────────────────────────────
 WHATSAPP_CONFIG = {
     "enabled":            True,
     "id_instance":        "7103531926",
@@ -110,18 +105,18 @@ STATE = {
     "mysql_user":      MYSQL_SETTINGS["user"],
     "mysql_host":      MYSQL_SETTINGS["host"],
     "stats": {
-        "total_inserts":    0,
-        "total_updates":    0,
-        "total_deletes":    0,
+        "total_inserts":      0,
+        "total_updates":      0,
+        "total_deletes":      0,
         "total_soft_deletes": 0,
-        "total_restores":   0,
-        "whatsapp_sent":    0,
-        "whatsapp_failed":  0,
-        "email_sent":       0,
-        "email_failed":     0,
-        "slack_sent":       0,
-        "slack_failed":     0,
-        "per_table":        {},
+        "total_restores":     0,
+        "whatsapp_sent":      0,
+        "whatsapp_failed":    0,
+        "email_sent":         0,
+        "email_failed":       0,
+        "slack_sent":         0,
+        "slack_failed":       0,
+        "per_table":          {},
     },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
@@ -206,40 +201,30 @@ def reset_daily_state():
 def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
     if not SLACK_CONFIG.get("enabled"):
         return
-
     bot_token = SLACK_CONFIG.get("bot_token", "")
     channel   = SLACK_CONFIG.get("channel", "#db-alerts")
-
     if not bot_token or not channel:
-        print("  ⚠  Slack: config incomplete (bot_token or channel missing)")
+        print("  ⚠  Slack: config incomplete")
         return
 
     COLOR_MAP = {
-        "INSERT":      "#22d87a",
-        "UPDATE":      "#f59e0b",
-        "DELETE":      "#f43f5e",
-        "SOFT_DELETE": "#a78bfa",
-        "RESTORE":     "#38bdf8",
+        "INSERT": "#22d87a", "UPDATE": "#f59e0b",
+        "DELETE": "#f43f5e", "SOFT_DELETE": "#a78bfa", "RESTORE": "#38bdf8",
     }
     ICON_MAP = {
-        "INSERT":      "🎉",
-        "UPDATE":      "✏️",
-        "DELETE":      "🗑️",
-        "SOFT_DELETE": "🚫",
-        "RESTORE":     "♻️",
+        "INSERT": "🎉", "UPDATE": "✏️", "DELETE": "🗑️",
+        "SOFT_DELETE": "🚫", "RESTORE": "♻️",
     }
     color = COLOR_MAP.get(event_type, "#6366f1")
     icon  = ICON_MAP.get(event_type, "📢")
 
-    # Build fields for attachment
     fields = [
-        {"title": "Database",  "value": db,                       "short": True},
-        {"title": "Table",     "value": f"`{table}`",              "short": True},
-        {"title": "Event",     "value": event_type.replace("_", " "), "short": True},
-        {"title": "Event ID",  "value": f"#{event_id}",            "short": True},
-        {"title": "Time",      "value": now_str(),                  "short": True},
+        {"title": "Database",  "value": db,                           "short": True},
+        {"title": "Table",     "value": f"`{table}`",                  "short": True},
+        {"title": "Event",     "value": event_type.replace("_", " "),  "short": True},
+        {"title": "Event ID",  "value": f"#{event_id}",                "short": True},
+        {"title": "Time",      "value": now_str(),                      "short": True},
     ]
-
     if record:
         rec_lines = []
         count = 0
@@ -250,49 +235,38 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
                 count += 1
         if rec_lines:
             fields.append({"title": "Record Details", "value": "\n".join(rec_lines), "short": False})
-
     if diff:
         diff_lines = []
         for d in diff[:5]:
             diff_lines.append(f"*{d['field']}:* `{d['before'] or '—'}` → `{d['after'] or '—'}`")
         if diff_lines:
             fields.append({"title": "Changes (Before → After)", "value": "\n".join(diff_lines), "short": False})
-
     if event_type == "DELETE":
         fields.append({"title": "⚠️ Warning", "value": "This record was *PERMANENTLY DELETED*", "short": False})
 
     payload = {
         "channel": channel,
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
-        "attachments": [
-            {
-                "color":       color,
-                "fields":      fields,
-                "footer":      "ADOPT Database Monitor v2",
-                "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
-                "ts":          int(datetime.now().timestamp()),
-            }
-        ],
+        "attachments": [{
+            "color":  color, "fields": fields,
+            "footer": "ADOPT Database Monitor v2",
+            "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
+            "ts":     int(datetime.now().timestamp()),
+        }],
     }
-
     try:
         resp = requests.post(
             "https://slack.com/api/chat.postMessage",
-            headers={
-                "Authorization": f"Bearer {bot_token}",
-                "Content-Type":  "application/json",
-            },
-            json=payload,
-            timeout=15,
+            headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
+            json=payload, timeout=15,
         )
         data = resp.json()
         if resp.status_code == 200 and data.get("ok"):
             STATE["stats"]["slack_sent"] += 1
-            print(f"  💬  Slack sent [{event_type}] -> {db}.{table}  ts={data.get('ts')}")
+            print(f"  💬  Slack sent [{event_type}] -> {db}.{table}")
         else:
             STATE["stats"]["slack_failed"] += 1
-            err = data.get("error", resp.text[:200])
-            print(f"  ✗  Slack failed [{resp.status_code}]: {err}")
+            print(f"  ✗  Slack failed: {data.get('error', resp.text[:200])}")
     except Exception as e:
         STATE["stats"]["slack_failed"] += 1
         print(f"  ✗  Slack error: {e}")
@@ -302,14 +276,10 @@ def should_send_slack(event_type, table):
     cfg = SLACK_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":
-        return cfg.get("on_delete", True)
-    if event_type == "SOFT_DELETE":
-        return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":
-        return cfg.get("on_restore", False)
-    if event_type == "UPDATE":
-        return cfg.get("on_update", False)
+    if event_type == "DELETE":     return cfg.get("on_delete", True)
+    if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
+    if event_type == "RESTORE":    return cfg.get("on_restore", False)
+    if event_type == "UPDATE":     return cfg.get("on_update", False)
     return False
 
 
@@ -319,35 +289,21 @@ def should_send_slack(event_type, table):
 def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     if not WHATSAPP_CONFIG.get("enabled"):
         return
-
     id_instance = WHATSAPP_CONFIG.get("id_instance", "")
     api_token   = WHATSAPP_CONFIG.get("api_token", "")
     api_url     = WHATSAPP_CONFIG.get("api_url", "").rstrip("/")
     recipient   = WHATSAPP_CONFIG.get("recipient_phone", "")
-
     if not all([id_instance, api_token, api_url, recipient]):
         print("  ⚠  WhatsApp: Green API config incomplete")
         return
 
-    ICON_MAP = {
-        "INSERT":      "🎉",
-        "UPDATE":      "✏️",
-        "DELETE":      "🗑️",
-        "SOFT_DELETE": "🚫",
-        "RESTORE":     "♻️",
-    }
+    ICON_MAP = {"INSERT": "🎉", "UPDATE": "✏️", "DELETE": "🗑️", "SOFT_DELETE": "🚫", "RESTORE": "♻️"}
     icon = ICON_MAP.get(event_type, "📢")
-
     lines = [
-        f"{icon} *ADOPT DB ALERT*",
-        f"━━━━━━━━━━━━━━━━━━",
-        f"*Event:* {event_type.replace('_', ' ')}",
-        f"*Database:* {db}",
-        f"*Table:* {table}",
-        f"*Time:* {now_str()}",
-        f"*Event ID:* #{event_id}",
+        f"{icon} *ADOPT DB ALERT*", "━━━━━━━━━━━━━━━━━━",
+        f"*Event:* {event_type.replace('_', ' ')}", f"*Database:* {db}",
+        f"*Table:* {table}", f"*Time:* {now_str()}", f"*Event ID:* #{event_id}",
     ]
-
     if record:
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("*Record Details:*")
@@ -357,34 +313,27 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
             if v_str and count < 5:
                 lines.append(f"• {k}: {v_str}")
                 count += 1
-
     if diff:
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("*Changes:*")
         for d in diff[:5]:
             lines.append(f"• {d['field']}: {d['before'] or '—'} → {d['after'] or '—'}")
-
     if event_type == "DELETE":
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("⚠️ *PERMANENTLY DELETED*")
-
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("_ADOPT Database Monitor_")
 
-    message = "\n".join(lines)
-    chat_id = f"{recipient}@c.us"
-    url = f"{api_url}/waInstance{id_instance}/sendMessage/{api_token}"
-
     try:
         resp = requests.post(
-            url,
-            json={"chatId": chat_id, "message": message},
+            f"{api_url}/waInstance{id_instance}/sendMessage/{api_token}",
+            json={"chatId": f"{recipient}@c.us", "message": "\n".join(lines)},
             timeout=15,
         )
         data = resp.json()
         if resp.status_code == 200 and data.get("idMessage"):
             STATE["stats"]["whatsapp_sent"] += 1
-            print(f"  📱  WhatsApp sent [{event_type}] -> {db}.{table}  msgId={data['idMessage']}")
+            print(f"  📱  WhatsApp sent [{event_type}] -> {db}.{table}")
         else:
             STATE["stats"]["whatsapp_failed"] += 1
             print(f"  ✗  WhatsApp failed [{resp.status_code}]: {resp.text[:200]}")
@@ -397,28 +346,22 @@ def should_send_whatsapp(event_type, table):
     cfg = WHATSAPP_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":
-        return cfg.get("on_delete", True)
-    if event_type == "SOFT_DELETE":
-        return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":
-        return cfg.get("on_restore", False)
-    if event_type == "UPDATE":
-        return cfg.get("on_update", False)
+    if event_type == "DELETE":     return cfg.get("on_delete", True)
+    if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
+    if event_type == "RESTORE":    return cfg.get("on_restore", False)
+    if event_type == "UPDATE":     return cfg.get("on_update", False)
     return False
 
 
 # ─────────────────────────────────────────────────────────────
-#  EMAIL via Resend API (HTTPS — works on Render)
+#  EMAIL via Resend API
 # ─────────────────────────────────────────────────────────────
 def send_email_notification(event_type, db, table, record_data, diff_data=None, meta=None):
     if not EMAIL_CONFIG.get("enabled"):
         return
-
     api_key    = EMAIL_CONFIG.get("api_key", "")
     from_email = EMAIL_CONFIG.get("from_email", "")
     to_email   = EMAIL_CONFIG.get("to_email", "")
-
     if not all([api_key, from_email, to_email]):
         print("  ⚠  Email: config incomplete")
         return
@@ -446,26 +389,21 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
               <td style='background:#f3fff3;color:#2e7d32;padding:8px 10px'>{d['after'] or '—'}</td>
             </tr>"""
         if diff_rows:
-            diff_html = f"""<h3 style="color:#555;margin:20px 0 8px;font-size:13px">🔄 Changes (Before → After)</h3>
-            <table style="width:100%;border-collapse:collapse">
-              <thead><tr>
+            diff_html = f"""<h3 style="color:#555;margin:20px 0 8px;font-size:13px">🔄 Changes</h3>
+            <table style="width:100%;border-collapse:collapse"><thead><tr>
                 <th style="background:#555;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Field</th>
                 <th style="background:#c62828;color:#fff;padding:8px 10px;text-align:left;font-size:11px">Before</th>
                 <th style="background:#2e7d32;color:#fff;padding:8px 10px;text-align:left;font-size:11px">After</th>
-              </tr></thead>
-              <tbody>{diff_rows}</tbody>
-            </table>"""
+            </tr></thead><tbody>{diff_rows}</tbody></table>"""
 
     record_section = ""
     if rows_html:
         record_section = (
             "<h3 style='color:#555;margin:20px 0 8px;font-size:13px'>📋 Record Details</h3>"
-            "<table style='width:100%;border-collapse:collapse'>"
-            "<thead><tr>"
+            "<table style='width:100%;border-collapse:collapse'><thead><tr>"
             f"<th style='background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Field</th>"
             f"<th style='background:{accent};color:#fff;padding:8px 12px;text-align:left;font-size:11px'>Value</th>"
-            "</tr></thead>"
-            f"<tbody>{rows_html}</tbody></table>"
+            f"</tr></thead><tbody>{rows_html}</tbody></table>"
         )
 
     html_body = f"""<html><body style="font-family:Arial,sans-serif;background:#f0f2f5;padding:20px">
@@ -481,33 +419,24 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
           <strong>DB:</strong> {db} &nbsp;|&nbsp;
           <strong>Table:</strong> {table}
         </p>
-        {diff_html}
-        {record_section}
+        {diff_html}{record_section}
       </div>
       <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
         ADOPT Database Monitor v2 — Event #{meta.get('Event ID', '')}
       </div>
-    </div>
-    </body></html>"""
+    </div></body></html>"""
 
     try:
         resp = requests.post(
             "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from":    from_email,
-                "to":      [to_email],
-                "subject": f"{subject_label} — {db} / {table}",
-                "html":    html_body,
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"from": from_email, "to": [to_email],
+                  "subject": f"{subject_label} — {db} / {table}", "html": html_body},
             timeout=15,
         )
         if resp.status_code == 200:
             STATE["stats"]["email_sent"] += 1
-            print(f"  ✉  Email sent via Resend [{event_type}] -> {db}.{table}")
+            print(f"  ✉  Email sent [{event_type}] -> {db}.{table}")
         else:
             STATE["stats"]["email_failed"] += 1
             print(f"  ✗  Email failed [{resp.status_code}]: {resp.text[:200]}")
@@ -531,15 +460,10 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
     meta["Detected At"]     = now_str()
 
     ev = {
-        "id":      _event_id,
-        "time":    now_str(),
-        "event":   event_type,
-        "db":      db,
-        "table":   table,
-        "details": details,
-        "meta":    meta,
-        "record":  {k: fmt_val(v) for k, v in (record or {}).items()},
-        "diff":    diff or [],
+        "id": _event_id, "time": now_str(), "event": event_type,
+        "db": db, "table": table, "details": details, "meta": meta,
+        "record": {k: fmt_val(v) for k, v in (record or {}).items()},
+        "diff": diff or [],
     }
     STATE["events"].insert(0, ev)
     if len(STATE["events"]) > 5000:
@@ -557,11 +481,8 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         STATE["stats"]["per_table"][tk]["delete"] += 1
 
     cmap = {
-        "INSERT":      "total_inserts",
-        "UPDATE":      "total_updates",
-        "DELETE":      "total_deletes",
-        "SOFT_DELETE": "total_soft_deletes",
-        "RESTORE":     "total_restores",
+        "INSERT": "total_inserts", "UPDATE": "total_updates",
+        "DELETE": "total_deletes", "SOFT_DELETE": "total_soft_deletes", "RESTORE": "total_restores",
     }
     if event_type in cmap:
         STATE["stats"][cmap[event_type]] += 1
@@ -574,31 +495,19 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
 
     STATE["last_event"] = now_str()
 
-    # ── Email notification ─────────────────────────────────
     is_customer  = table in CUSTOMER_TABLES
     should_email = (event_type == "INSERT" and is_customer) or event_type == "DELETE"
     if should_email and EMAIL_CONFIG.get("enabled"):
-        threading.Thread(
-            target=send_email_notification,
-            args=(event_type, db, table, record or {}, diff, meta),
-            daemon=True,
-        ).start()
+        threading.Thread(target=send_email_notification,
+            args=(event_type, db, table, record or {}, diff, meta), daemon=True).start()
 
-    # ── WhatsApp notification ──────────────────────────────
     if should_send_whatsapp(event_type, table) and WHATSAPP_CONFIG.get("enabled"):
-        threading.Thread(
-            target=send_whatsapp,
-            args=(event_type, db, table, record, diff, _event_id),
-            daemon=True,
-        ).start()
+        threading.Thread(target=send_whatsapp,
+            args=(event_type, db, table, record, diff, _event_id), daemon=True).start()
 
-    # ── Slack notification ─────────────────────────────────
     if should_send_slack(event_type, table) and SLACK_CONFIG.get("enabled"):
-        threading.Thread(
-            target=send_slack,
-            args=(event_type, db, table, record, diff, _event_id),
-            daemon=True,
-        ).start()
+        threading.Thread(target=send_slack,
+            args=(event_type, db, table, record, diff, _event_id), daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -649,7 +558,6 @@ def check_binlog_status():
             ok    = value.upper() == expected.upper()
             if not ok: all_ok = False
             print(f"  {'✔' if ok else '✗'}  {label}: {value}")
-
         cursor.execute("SHOW MASTER STATUS")
         master = cursor.fetchone()
         if master:
@@ -659,20 +567,17 @@ def check_binlog_status():
             print(f"  ✔  Binlog file: {vals[0]}  position: {vals[1]}")
         else:
             all_ok = False
-
         cursor.execute("SELECT VERSION() as v, USER() as u")
         info = cursor.fetchone()
         if info:
             print(f"  ℹ  MySQL version: {info['v']}  |  Connected as: {info['u']}")
             STATE["mysql_user"] = info["u"]
-
         cursor.close(); conn.close()
         print(f"\n  {'✔  All checks passed!' if all_ok else '✗  Some checks failed'}")
     except Exception as e:
         print(f"  ✗  Cannot connect: {e}")
     print("="*70 + "\n")
 
-    # Email config status
     print("="*70)
     print("  EMAIL STATUS")
     print("="*70)
@@ -680,14 +585,11 @@ def check_binlog_status():
     if not em.get("enabled"):
         print("  ✗  Email DISABLED")
     else:
-        print(f"  ✔  Provider: Resend API (HTTPS — works on Render)")
-        print(f"  ✔  From: {em.get('from_email')}")
-        print(f"  ✔  To:   {em.get('to_email')}")
         key = em.get("api_key", "")
-        print(f"  ✔  API Key: {key[:8]}...{key[-4:] if len(key) > 12 else '(too short?)'}")
+        print(f"  ✔  From: {em.get('from_email')}  To: {em.get('to_email')}")
+        print(f"  ✔  API Key: {key[:8]}...{key[-4:]}")
     print("="*70 + "\n")
 
-    # WhatsApp config status
     print("="*70)
     print("  WHATSAPP (Green API) STATUS")
     print("="*70)
@@ -695,12 +597,10 @@ def check_binlog_status():
     if not wa.get("enabled"):
         print("  ✗  WhatsApp DISABLED")
     else:
-        print(f"  ✔  Green API instance: {wa.get('id_instance')}")
-        print(f"  ✔  Recipient: {wa.get('recipient_phone')}")
+        print(f"  ✔  Instance: {wa.get('id_instance')}  Recipient: {wa.get('recipient_phone')}")
         print(f"  ✔  Alerts: INSERT_CUSTOMER={wa.get('on_insert_customer')} | DELETE={wa.get('on_delete')} | SOFT_DELETE={wa.get('on_soft_delete')}")
     print("="*70 + "\n")
 
-    # Slack config status
     print("="*70)
     print("  SLACK STATUS")
     print("="*70)
@@ -710,7 +610,7 @@ def check_binlog_status():
     else:
         token = sl.get("bot_token", "")
         print(f"  ✔  Channel: {sl.get('channel')}")
-        print(f"  ✔  Token: {token[:12]}...{token[-4:] if len(token) > 16 else '(too short?)'}")
+        print(f"  ✔  Token: {token[:12]}...{token[-4:]}")
         print(f"  ✔  Alerts: INSERT_CUSTOMER={sl.get('on_insert_customer')} | DELETE={sl.get('on_delete')} | SOFT_DELETE={sl.get('on_soft_delete')}")
     print("="*70 + "\n")
 
@@ -740,7 +640,6 @@ def binlog_monitor():
             STATE["ready"] = True
 
             for binlog_event in stream:
-
                 if isinstance(binlog_event, RotateEvent):
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
@@ -780,17 +679,14 @@ def binlog_monitor():
                             detail = "SOFT DELETE — " + format_row(after)
                             print(f"  [SOFT_DELETE] {db}.{table}")
                             push_event("SOFT_DELETE", db, table, detail, record=after, diff=diff)
-
                         elif is_del_before == "1" and is_del_after == "0":
                             detail = "RESTORED — " + format_row(after)
                             print(f"  [RESTORE] {db}.{table}")
                             push_event("RESTORE", db, table, detail, record=after, diff=diff)
-
                         else:
                             if diff:
                                 detail = "Changed: " + " | ".join(
-                                    f"{d['field']}: {d['before']} → {d['after']}" for d in diff
-                                )
+                                    f"{d['field']}: {d['before']} → {d['after']}" for d in diff)
                             else:
                                 detail = "No column changes"
                             print(f"  [UPDATE] {db}.{table}")
@@ -817,18 +713,11 @@ def api_events():
     db_f   = freq.args.get("db",    "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
     search = freq.args.get("search","").strip().lower()
-
     evs = STATE["events"]
-    if db_f:
-        evs = [e for e in evs if e["db"] == db_f]
-    if ev_f and ev_f != "ALL":
-        evs = [e for e in evs if e["event"] == ev_f]
-    if search:
-        evs = [e for e in evs if
-               search in e["db"].lower() or
-               search in e["table"].lower() or
-               search in e["details"].lower()]
-
+    if db_f:   evs = [e for e in evs if e["db"] == db_f]
+    if ev_f and ev_f != "ALL": evs = [e for e in evs if e["event"] == ev_f]
+    if search: evs = [e for e in evs if search in e["db"].lower() or
+                      search in e["table"].lower() or search in e["details"].lower()]
     total = len(evs)
     paged = evs[offset: offset + limit]
     return jsonify({"events": paged, "total": total, "offset": offset, "limit": limit})
@@ -891,17 +780,14 @@ def api_export_csv():
     db_f   = freq.args.get("db",    "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
     search = freq.args.get("search","").strip().lower()
-
     evs = STATE["events"]
     if db_f:  evs = [e for e in evs if e["db"] == db_f]
     if ev_f and ev_f != "ALL": evs = [e for e in evs if e["event"] == ev_f]
     if search: evs = [e for e in evs if search in e["db"].lower() or
                       search in e["table"].lower() or search in e["details"].lower()]
-
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID","Time","Event","Database","Table","Details",
-                     "Binlog File","Binlog Position","MySQL User"])
+    writer.writerow(["ID","Time","Event","Database","Table","Details","Binlog File","Binlog Position","MySQL User"])
     for e in evs:
         writer.writerow([
             e.get("id",""), e.get("time",""), e.get("event",""),
@@ -910,16 +796,12 @@ def api_export_csv():
             e.get("meta",{}).get("Binlog Position",""),
             e.get("meta",{}).get("MySQL User",""),
         ])
-
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=adopt_events.csv"}
-    )
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=adopt_events.csv"})
 
 
 # ─────────────────────────────────────────────────────────────
-#  DASHBOARD HTML
+#  DASHBOARD HTML  (same as old working code + Slack panel added)
 # ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -931,15 +813,13 @@ HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
       --muted:#4a5a75;--ins:#22d87a;--upd:#f59e0b;--del:#f43f5e;
-      --rest:#38bdf8;--soft:#a78bfa;--acc:#6366f1;--wa:#25d366;--sl:#4a154b;--sl2:#e01e5a}
+      --rest:#38bdf8;--soft:#a78bfa;--acc:#6366f1;--wa:#25d366;--sl:#e01e5a}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;min-height:100vh}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-header{display:flex;align-items:center;justify-content:space-between;
-       padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);
-       position:sticky;top:0;z-index:100}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
 .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:#fff}
 .logo span{color:var(--acc)}
 .logo sub{font-size:10px;color:var(--muted);font-weight:400;margin-left:4px}
@@ -951,76 +831,68 @@ header{display:flex;align-items:center;justify-content:space-between;
 .b-up{background:#38bdf818;color:#38bdf8;border:1px solid #38bdf844}
 .b-wa{background:#25d36618;color:#25d366;border:1px solid #25d36644}
 .b-sl{background:#e01e5a18;color:#e01e5a;border:1px solid #e01e5a44}
-.pulse{display:inline-block;width:6px;height:6px;border-radius:50%;
-       background:#22d87a;margin-right:4px;animation:blink 1.4s infinite}
+.pulse{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22d87a;margin-right:4px;animation:blink 1.4s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-#loading{display:flex;flex-direction:column;align-items:center;
-         justify-content:center;height:70vh;gap:14px;color:var(--muted)}
-.spinner{width:36px;height:36px;border:3px solid var(--border);
-         border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
+#loading{display:flex;flex-direction:column;align-items:center;justify-content:center;height:70vh;gap:14px;color:var(--muted)}
+.spinner{width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 #content{display:none}
-.info-bar{display:flex;gap:10px;padding:12px 24px;background:var(--surf2);
-          border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:10px;color:var(--muted)}
+.info-bar{display:flex;gap:10px;padding:12px 24px;background:var(--surf2);border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:10px;color:var(--muted)}
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
-.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;
-        padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s}
+.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s}
 .metric:hover{border-color:var(--acc)}
 .metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
 .metric-val{font-size:22px;font-weight:700;font-family:'Syne',sans-serif}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
-.c-em{color:#f59e0b}.c-sl{color:#e01e5a}
-.tabs-bar{display:flex;gap:0;padding:0 24px;border-bottom:1px solid var(--border);
-          overflow-x:auto;background:var(--surf)}
-.tab{padding:10px 16px;font-size:11px;cursor:pointer;color:var(--muted);
-     border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s}
-.tab:hover{color:var(--text)}
-.tab.active{color:#fff;border-bottom-color:var(--acc)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));
-      gap:10px;padding:16px 24px}
-.db-card{background:var(--surf);border:1px solid var(--border);border-radius:8px;
-         padding:12px 14px;transition:border-color .2s;cursor:pointer}
-.db-card:hover{border-color:var(--acc)}
-.db-card.active-db{border-color:var(--acc);background:var(--surf2)}
-.db-name{font-size:9px;color:var(--muted);margin-bottom:5px;
-         white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c-em{color:#f59e0b}.c-sl{color:var(--sl)}
+.notif-row{display:flex;gap:12px;margin:0 24px 16px;flex-wrap:wrap}
+.notif-box{flex:1;min-width:260px;border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.wa-box{background:var(--surf);border:1px solid #25d36644}
+.sl-box{background:var(--surf);border:1px solid #e01e5a44}
+.notif-icon{font-size:22px}
+.notif-info{flex:1}
+.notif-title{font-size:12px;font-weight:700;margin-bottom:3px}
+.wa-title{color:#25d366}.sl-title{color:#e01e5a}
+.notif-sub{font-size:10px;color:var(--muted)}
+.notif-stats{display:flex;gap:14px}
+.notif-stat{text-align:center}
+.notif-stat-val{font-size:18px;font-weight:700;font-family:'Syne',sans-serif}
+.wa-stat-val{color:#25d366}.sl-stat-val{color:#e01e5a}
+.notif-stat-lbl{font-size:9px;color:var(--muted)}
+.tabs-bar{display:flex;gap:0;padding:0 24px;border-bottom:1px solid var(--border);overflow-x:auto;background:var(--surf)}
+.tab{padding:10px 16px;font-size:11px;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s}
+.tab:hover{color:var(--text)}.tab.active{color:#fff;border-bottom-color:var(--acc)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px;padding:16px 24px}
+.db-card{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 14px;transition:border-color .2s;cursor:pointer}
+.db-card:hover{border-color:var(--acc)}.db-card.active-db{border-color:var(--acc);background:var(--surf2)}
+.db-name{font-size:9px;color:var(--muted);margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .db-count{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;color:#fff}
 .db-label{font-size:9px;color:var(--muted);margin-top:2px}
 .log-wrap{margin:0 24px 24px;background:var(--surf);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-.log-header{display:flex;align-items:center;justify-content:space-between;
-            padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
+.log-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
 .log-header h3{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:#fff}
 .controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.flt{background:transparent;border:1px solid var(--border);color:var(--muted);
-     font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;
-     cursor:pointer;transition:all .15s}
+.flt{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer;transition:all .15s}
 .flt:hover,.flt.active{border-color:var(--acc);color:#fff}
 .flt.fi.active{border-color:var(--ins);color:var(--ins);background:#22d87a0d}
 .flt.fu.active{border-color:var(--upd);color:var(--upd);background:#f59e0b0d}
 .flt.fd.active{border-color:var(--del);color:var(--del);background:#f43f5e0d}
 .flt.fs.active{border-color:var(--soft);color:var(--soft);background:#a78bfa0d}
 .flt.fr.active{border-color:var(--rest);color:var(--rest);background:#38bdf80d}
-.search-box{background:var(--surf2);border:1px solid var(--border);color:var(--text);
-            font-family:inherit;font-size:11px;padding:4px 10px;border-radius:6px;
-            outline:none;width:180px;transition:border-color .15s}
+.search-box{background:var(--surf2);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:11px;padding:4px 10px;border-radius:6px;outline:none;width:180px;transition:border-color .15s}
 .search-box:focus{border-color:var(--acc)}
-.btn-csv{background:var(--acc);color:#fff;border:none;font-family:inherit;
-         font-size:10px;padding:4px 12px;border-radius:6px;cursor:pointer;transition:opacity .15s}
+.btn-csv{background:var(--acc);color:#fff;border:none;font-family:inherit;font-size:10px;padding:4px 12px;border-radius:6px;cursor:pointer;transition:opacity .15s}
 .btn-csv:hover{opacity:.85}
-.btn-sound{background:transparent;border:1px solid var(--border);color:var(--muted);
-           font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer}
+.btn-sound{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer}
 .btn-sound.on{border-color:var(--ins);color:var(--ins)}
 .log-body{max-height:500px;overflow-y:auto}
-.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;
-    gap:10px;align-items:start;padding:9px 16px;
-    border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer}
+.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer}
 .ev:hover{background:#ffffff05}
 .ev-time{color:var(--muted);font-size:10px;line-height:1.4}
-.ev-type{font-weight:700;font-size:10px;letter-spacing:.4px;
-         padding:2px 7px;border-radius:4px;width:fit-content;white-space:nowrap}
+.ev-type{font-weight:700;font-size:10px;letter-spacing:.4px;padding:2px 7px;border-radius:4px;width:fit-content;white-space:nowrap}
 .ev-type.INSERT{background:#22d87a14;color:var(--ins);border:1px solid #22d87a30}
 .ev-type.UPDATE{background:#f59e0b14;color:var(--upd);border:1px solid #f59e0b30}
 .ev-type.DELETE{background:#f43f5e14;color:var(--del);border:1px solid #f43f5e30}
@@ -1030,66 +902,36 @@ header{display:flex;align-items:center;justify-content:space-between;
 .ev-detail{color:var(--muted);font-size:10px;word-break:break-word;line-height:1.5}
 .ev-arrow{color:var(--muted);font-size:12px;text-align:center;padding-top:2px}
 .empty{text-align:center;padding:40px;color:var(--muted);font-size:12px}
-.pager{padding:10px 16px;border-top:1px solid var(--border);display:flex;
-       align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:10px}
-.pager-info{color:var(--muted)}
-.pager-btns{display:flex;gap:6px}
-.tbl-stats{margin:0 24px 16px;background:var(--surf);border:1px solid var(--border);
-           border-radius:10px;overflow:hidden}
-.tbl-stats-hdr{padding:10px 16px;border-bottom:1px solid var(--border);
-               font-family:'Syne',sans-serif;font-size:12px;font-weight:700;color:#fff}
+.pager{padding:10px 16px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:10px}
+.pager-info{color:var(--muted)}.pager-btns{display:flex;gap:6px}
+.tbl-stats{margin:0 24px 16px;background:var(--surf);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.tbl-stats-hdr{padding:10px 16px;border-bottom:1px solid var(--border);font-family:'Syne',sans-serif;font-size:12px;font-weight:700;color:#fff}
 .tbl-stats-body{max-height:200px;overflow-y:auto}
-.tbl-row{display:grid;grid-template-columns:200px 1fr 60px 60px 60px 60px;
-         gap:8px;padding:7px 16px;border-bottom:1px solid #ffffff05;font-size:10px;align-items:center}
+.tbl-row{display:grid;grid-template-columns:200px 1fr 60px 60px 60px 60px;gap:8px;padding:7px 16px;border-bottom:1px solid #ffffff05;font-size:10px;align-items:center}
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-.notif-panels{display:flex;gap:12px;margin:0 24px 16px;flex-wrap:wrap}
-.notif-panel{flex:1;min-width:260px;background:var(--surf);border-radius:10px;
-             padding:14px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.wa-panel{border:1px solid #25d36644}
-.sl-panel{border:1px solid #e01e5a44}
-.notif-icon{font-size:24px}
-.notif-info{flex:1}
-.notif-title{font-size:12px;font-weight:700;margin-bottom:3px}
-.wa-title{color:#25d366}
-.sl-title{color:#e01e5a}
-.notif-sub{font-size:10px;color:var(--muted)}
-.notif-stats{display:flex;gap:14px}
-.notif-stat{text-align:center}
-.notif-stat-val{font-size:18px;font-weight:700;font-family:'Syne',sans-serif}
-.wa-stat-val{color:#25d366}
-.sl-stat-val{color:#e01e5a}
-.notif-stat-lbl{font-size:9px;color:var(--muted)}
-.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;
-               align-items:center;justify-content:center;padding:20px}
+.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;
-       max-width:700px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative}
-.modal-close{position:absolute;top:14px;right:16px;background:none;border:none;
-             color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:700px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative}
+.modal-close{position:absolute;top:14px;right:16px;background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
 .modal-close:hover{color:#fff}
 .modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px}
 .m-section{margin-bottom:18px}
-.m-section h4{font-size:10px;text-transform:uppercase;letter-spacing:.8px;
-              color:var(--muted);margin-bottom:8px;padding-bottom:5px;
-              border-bottom:1px solid var(--border)}
+.m-section h4{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid var(--border)}
 .m-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .m-item{background:var(--surf2);border-radius:6px;padding:8px 10px}
 .m-item .lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
 .m-item .val{font-size:12px;color:#fff;word-break:break-all}
 .diff-table{width:100%;border-collapse:collapse;font-size:11px}
-.diff-table th{background:var(--surf2);padding:6px 10px;text-align:left;
-               color:var(--muted);font-size:9px;text-transform:uppercase}
+.diff-table th{background:var(--surf2);padding:6px 10px;text-align:left;color:var(--muted);font-size:9px;text-transform:uppercase}
 .diff-table td{padding:6px 10px;border-bottom:1px solid var(--border)}
-.diff-table .before{color:#f87171}
-.diff-table .after{color:#4ade80}
+.diff-table .before{color:#f87171}.diff-table .after{color:#4ade80}
 .rec-table{width:100%;border-collapse:collapse;font-size:11px}
 .rec-table td{padding:5px 10px;border-bottom:1px solid var(--border);vertical-align:top}
 .rec-table td:first-child{color:var(--muted);width:180px;white-space:nowrap}
 .rec-table td:last-child{color:#fff;word-break:break-word}
-.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);
-            border-top:1px solid var(--border);display:flex;justify-content:space-between}
+.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
 </style>
 </head>
 <body>
@@ -1133,26 +975,23 @@ header{display:flex;align-items:center;justify-content:space-between;
     <div class="metric"><div class="metric-label">💬 Slack Sent</div><div class="metric-val c-sl" id="m-slack">0</div></div>
   </div>
 
-  <div class="notif-panels">
-    <!-- WhatsApp Panel -->
-    <div class="notif-panel wa-panel">
+  <div class="notif-row">
+    <div class="notif-box wa-box">
       <div class="notif-icon">📱</div>
       <div class="notif-info">
         <div class="notif-title wa-title">WhatsApp (Green API)</div>
-        <div class="notif-sub" id="wa-status-text">Checking status...</div>
+        <div class="notif-sub" id="wa-status-text">Checking...</div>
       </div>
       <div class="notif-stats">
         <div class="notif-stat"><div class="notif-stat-val wa-stat-val" id="wa-sent-big">0</div><div class="notif-stat-lbl">Sent</div></div>
         <div class="notif-stat"><div class="notif-stat-val" style="color:#f43f5e" id="wa-fail-big">0</div><div class="notif-stat-lbl">Failed</div></div>
       </div>
     </div>
-
-    <!-- Slack Panel -->
-    <div class="notif-panel sl-panel">
+    <div class="notif-box sl-box">
       <div class="notif-icon">💬</div>
       <div class="notif-info">
         <div class="notif-title sl-title">Slack Notifications</div>
-        <div class="notif-sub" id="sl-status-text">Checking status...</div>
+        <div class="notif-sub" id="sl-status-text">Checking...</div>
       </div>
       <div class="notif-stats">
         <div class="notif-stat"><div class="notif-stat-val sl-stat-val" id="sl-sent-big">0</div><div class="notif-stat-lbl">Sent</div></div>
@@ -1208,221 +1047,65 @@ header{display:flex;align-items:center;justify-content:space-between;
 </div>
 
 <script>
-let activeFilter  = 'ALL';
-let activeDB      = 'all';
-let searchTerm    = '';
-let pageOffset    = 0;
-let pageSize      = 100;
-let totalEvents   = 0;
-let allEvents     = [];
-let initialized   = false;
-let soundEnabled  = false;
-let lastEventId   = 0;
-let maxTableTotal = 1;
-const AudioCtx    = window.AudioContext || window.webkitAudioContext;
-
-function toggleSound(){
-  soundEnabled = !soundEnabled;
-  const btn = document.getElementById('sound-btn');
-  btn.textContent = soundEnabled ? '🔔 Sound ON' : '🔔 Sound OFF';
-  btn.classList.toggle('on', soundEnabled);
-}
-function playBeep(freq=440, dur=0.12, vol=0.15){
-  try{
-    const ctx = new AudioCtx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.value = freq;
-    gain.gain.setValueAtTime(vol, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
-    osc.start(); osc.stop(ctx.currentTime + dur);
-  } catch(e){}
-}
-function switchTab(db){
-  activeDB = db; pageOffset = 0;
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById('tab-'+(db==='all'?'all':db))?.classList.add('active');
-  document.querySelectorAll('.db-card').forEach(c => {
-    c.classList.toggle('active-db', c.dataset.db === db);
-  });
-  load();
-}
-function setFilter(f){
-  activeFilter = f; pageOffset = 0;
-  document.querySelectorAll('.flt').forEach(b => b.classList.remove('active'));
-  const map = {ALL:'f-all',INSERT:'fi',UPDATE:'fu',DELETE:'fd',SOFT_DELETE:'fs',RESTORE:'fr'};
-  document.querySelector('.'+map[f])?.classList.add('active');
-  load();
-}
-function onSearch(){
-  searchTerm = document.getElementById('search-box').value;
-  pageOffset = 0; load();
-}
-function changePage(dir){
-  pageOffset = Math.max(0, pageOffset + dir * pageSize); load();
-}
-function exportCSV(){
-  const db  = activeDB !== 'all' ? `&db=${activeDB}` : '';
-  const ev  = activeFilter !== 'ALL' ? `&event=${activeFilter}` : '';
-  const s   = searchTerm ? `&search=${encodeURIComponent(searchTerm)}` : '';
-  window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);
-}
-async function openModal(id){
-  const resp = await fetch(`/api/event/${id}`);
-  if(!resp.ok) return;
-  const e = await resp.json();
-  document.getElementById('modal-title').innerHTML =
-    `<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
-  let html = '';
-  if(e.meta){
-    html += '<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';
-    for(const [k,v] of Object.entries(e.meta)){
-      if(v) html += `<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;
-    }
-    html += '</div></div>';
-  }
-  if(e.diff && e.diff.length){
-    html += '<div class="m-section"><h4>🔄 Before → After Changes</h4>';
-    html += '<table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';
-    for(const d of e.diff){
-      html += `<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;
-    }
-    html += '</tbody></table></div>';
-  }
-  if(e.record && Object.keys(e.record).length){
-    html += '<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';
-    for(const [k,v] of Object.entries(e.record)){
-      if(v!==null && v!==undefined && v!=='')
-        html += `<tr><td>${k}</td><td>${v}</td></tr>`;
-    }
-    html += '</table></div>';
-  }
-  document.getElementById('modal-body').innerHTML = html;
-  document.getElementById('modal').classList.add('open');
-}
-function closeModal(){
-  document.getElementById('modal').classList.remove('open');
-}
-function renderEvents(){
-  const el = document.getElementById('events');
-  if(!allEvents.length){
-    el.innerHTML = '<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';
-    return;
-  }
-  el.innerHTML = allEvents.map(x => `
-    <div class="ev" onclick="openModal(${x.id})">
-      <span class="ev-time">${x.time}</span>
-      <span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span>
-      <span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span>
-      <span class="ev-detail">${x.details||''}</span>
-      <span class="ev-arrow">›</span>
-    </div>`).join('');
-}
-function renderPagination(){
-  const el  = document.getElementById('pagination');
-  const tot = totalEvents;
-  const cur = Math.floor(pageOffset/pageSize)+1;
-  const max = Math.max(1, Math.ceil(tot/pageSize));
-  el.innerHTML = `
-    <span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span>
-    <div class="pager-btns">
-      <button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button>
-      <span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span>
-      <button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button>
-    </div>`;
-}
-function renderTableStats(rows){
-  if(!rows.length) return;
-  maxTableTotal = Math.max(...rows.map(r=>r.total), 1);
-  const el = document.getElementById('tbl-stats-body');
-  el.innerHTML = rows.map(r => `
-    <div class="tbl-row">
-      <span style="color:#94a3b8;font-size:10px" title="${r.db}">${r.table}</span>
-      <div class="tbl-bar-wrap"><div class="tbl-bar" style="width:${Math.round(r.total/maxTableTotal*100)}%"></div></div>
-      <span style="color:var(--ins)">${r.insert}</span>
-      <span style="color:var(--upd)">${r.update}</span>
-      <span style="color:var(--del)">${r.delete}</span>
-      <span style="color:#fff;font-weight:700">${r.total}</span>
-    </div>`).join('');
-}
+let activeFilter='ALL',activeDB='all',searchTerm='',pageOffset=0,pageSize=100;
+let totalEvents=0,allEvents=[],initialized=false,soundEnabled=false,lastEventId=0,maxTableTotal=1;
+const AudioCtx=window.AudioContext||window.webkitAudioContext;
+function toggleSound(){soundEnabled=!soundEnabled;const b=document.getElementById('sound-btn');b.textContent=soundEnabled?'🔔 Sound ON':'🔔 Sound OFF';b.classList.toggle('on',soundEnabled);}
+function playBeep(f=440,d=0.12,v=0.15){try{const c=new AudioCtx(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=f;g.gain.setValueAtTime(v,c.currentTime);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+d);o.start();o.stop(c.currentTime+d);}catch(e){}}
+function switchTab(db){activeDB=db;pageOffset=0;document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById('tab-'+(db==='all'?'all':db))?.classList.add('active');document.querySelectorAll('.db-card').forEach(c=>{c.classList.toggle('active-db',c.dataset.db===db)});load();}
+function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.flt').forEach(b=>b.classList.remove('active'));const map={ALL:'f-all',INSERT:'fi',UPDATE:'fu',DELETE:'fd',SOFT_DELETE:'fs',RESTORE:'fr'};document.querySelector('.'+map[f])?.classList.add('active');load();}
+function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
+function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
+function exportCSV(){const db=activeDB!=='all'?`&db=${activeDB}`:'';const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);}
+async function openModal(id){const resp=await fetch(`/api/event/${id}`);if(!resp.ok)return;const e=await resp.json();document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;let html='';if(e.meta){html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}html+='</div></div>';}if(e.diff&&e.diff.length){html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}html+='</tbody></table></div>';}if(e.record&&Object.keys(e.record).length){html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}html+='</table></div>';}document.getElementById('modal-body').innerHTML=html;document.getElementById('modal').classList.add('open');}
+function closeModal(){document.getElementById('modal').classList.remove('open');}
+function renderEvents(){const el=document.getElementById('events');if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}el.innerHTML=allEvents.map(x=>`<div class="ev" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');}
+function renderPagination(){const el=document.getElementById('pagination');const tot=totalEvents;const cur=Math.floor(pageOffset/pageSize)+1;const max=Math.max(1,Math.ceil(tot/pageSize));el.innerHTML=`<span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span><div class="pager-btns"><button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button><span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span><button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button></div>`;}
+function renderTableStats(rows){if(!rows.length)return;maxTableTotal=Math.max(...rows.map(r=>r.total),1);document.getElementById('tbl-stats-body').innerHTML=rows.map(r=>`<div class="tbl-row"><span style="color:#94a3b8;font-size:10px" title="${r.db}">${r.table}</span><div class="tbl-bar-wrap"><div class="tbl-bar" style="width:${Math.round(r.total/maxTableTotal*100)}%"></div></div><span style="color:var(--ins)">${r.insert}</span><span style="color:var(--upd)">${r.update}</span><span style="color:var(--del)">${r.delete}</span><span style="color:#fff;font-weight:700">${r.total}</span></div>`).join('');}
 async function load(){
   try{
-    const s = await fetch('/api/stats').then(r=>r.json());
-    if(!s.ready) return;
-    if(!initialized){
-      document.getElementById('loading').style.display = 'none';
-      document.getElementById('content').style.display = 'block';
-      initialized = true;
-    }
-    document.getElementById('email-badge').textContent  = s.email_enabled ? '📧 EMAIL ON' : '📧 EMAIL OFF';
-    document.getElementById('wa-badge').textContent     = s.whatsapp_enabled ? '📱 WA ON' : '📱 WA OFF';
-    document.getElementById('sl-badge').textContent     = s.slack_enabled ? '💬 SLACK ON' : '💬 SLACK OFF';
-    document.getElementById('uptime-badge').textContent = `⏱ ${s.uptime}`;
-    document.getElementById('i-binlog').textContent = s.binlog_file || '—';
-    document.getElementById('i-pos').textContent    = s.binlog_position || '—';
-    document.getElementById('i-user').textContent   = s.mysql_user || '—';
-    document.getElementById('i-host').textContent   = s.mysql_host || '—';
-    document.getElementById('i-start').textContent  = s.start_time || '—';
-    document.getElementById('m-dbs').textContent   = s.databases;
-    document.getElementById('m-total').textContent = s.total_events;
-    document.getElementById('m-ins').textContent   = s.total_inserts;
-    document.getElementById('m-upd').textContent   = s.total_updates;
-    document.getElementById('m-del').textContent   = s.total_deletes;
-    document.getElementById('m-soft').textContent  = s.total_soft_deletes;
-    document.getElementById('m-rest').textContent  = s.total_restores;
-    document.getElementById('m-wa').textContent    = s.whatsapp_sent || 0;
-    document.getElementById('m-email').textContent = s.email_sent || 0;
-    document.getElementById('m-slack').textContent = s.slack_sent || 0;
-    document.getElementById('wa-sent-big').textContent = s.whatsapp_sent || 0;
-    document.getElementById('wa-fail-big').textContent = s.whatsapp_failed || 0;
-    document.getElementById('sl-sent-big').textContent = s.slack_sent || 0;
-    document.getElementById('sl-fail-big').textContent = s.slack_failed || 0;
-    document.getElementById('wa-status-text').textContent = s.whatsapp_enabled
-      ? `Active — Sending alerts for: INSERT (customer), DELETE, SOFT DELETE`
-      : `Disabled`;
-    document.getElementById('sl-status-text').textContent = s.slack_enabled
-      ? `Active — Channel: ${s.slack_channel || '#db-alerts'} | INSERT (customer), DELETE, SOFT DELETE`
-      : `Disabled`;
-    if(s.last_event) document.getElementById('last-event').textContent = 'Last event: '+s.last_event;
-    const counts = await fetch('/api/counts').then(r=>r.json());
-    const tabsBar = document.getElementById('tabs-bar');
-    const existing = new Set([...tabsBar.querySelectorAll('.tab')].map(t=>t.dataset.db||'all'));
-    for(const db of Object.keys(counts)){
-      if(!existing.has(db)){
-        const t = document.createElement('div');
-        t.className = 'tab'; t.dataset.db = db;
-        t.textContent = db.replace('adopt','');
-        t.onclick = ()=>switchTab(db);
-        t.id = 'tab-'+db;
-        tabsBar.appendChild(t);
-      }
-    }
-    document.getElementById('cards').innerHTML =
-      Object.entries(counts).map(([db,cnt]) =>
-        `<div class="db-card ${activeDB===db?'active-db':''}" data-db="${db}" onclick="switchTab('${db}')">
-           <div class="db-name">${db}</div>
-           <div class="db-count">${cnt}</div>
-           <div class="db-label">customers</div>
-         </div>`).join('');
-    const db_param = activeDB !== 'all' ? `&db=${activeDB}` : '';
-    const ev_param = activeFilter !== 'ALL' ? `&event=${activeFilter}` : '';
-    const sr_param = searchTerm ? `&search=${encodeURIComponent(searchTerm)}` : '';
-    const evResp   = await fetch(`/api/events?limit=${pageSize}&offset=${pageOffset}${db_param}${ev_param}${sr_param}`).then(r=>r.json());
-    if(evResp.events.length && evResp.events[0].id > lastEventId){
-      if(soundEnabled) playBeep(660, 0.1, 0.1);
-      lastEventId = evResp.events[0].id;
-    }
-    allEvents   = evResp.events;
-    totalEvents = evResp.total;
-    renderEvents();
-    renderPagination();
-    const tStats = await fetch('/api/table_stats').then(r=>r.json());
-    renderTableStats(tStats);
-  } catch(e){ console.error(e); }
+    const s=await fetch('/api/stats').then(r=>r.json());
+    if(!s.ready)return;
+    if(!initialized){document.getElementById('loading').style.display='none';document.getElementById('content').style.display='block';initialized=true;}
+    document.getElementById('email-badge').textContent=s.email_enabled?'📧 EMAIL ON':'📧 EMAIL OFF';
+    document.getElementById('wa-badge').textContent=s.whatsapp_enabled?'📱 WA ON':'📱 WA OFF';
+    document.getElementById('sl-badge').textContent=s.slack_enabled?'💬 SLACK ON':'💬 SLACK OFF';
+    document.getElementById('uptime-badge').textContent=`⏱ ${s.uptime}`;
+    document.getElementById('i-binlog').textContent=s.binlog_file||'—';
+    document.getElementById('i-pos').textContent=s.binlog_position||'—';
+    document.getElementById('i-user').textContent=s.mysql_user||'—';
+    document.getElementById('i-host').textContent=s.mysql_host||'—';
+    document.getElementById('i-start').textContent=s.start_time||'—';
+    document.getElementById('m-dbs').textContent=s.databases;
+    document.getElementById('m-total').textContent=s.total_events;
+    document.getElementById('m-ins').textContent=s.total_inserts;
+    document.getElementById('m-upd').textContent=s.total_updates;
+    document.getElementById('m-del').textContent=s.total_deletes;
+    document.getElementById('m-soft').textContent=s.total_soft_deletes;
+    document.getElementById('m-rest').textContent=s.total_restores;
+    document.getElementById('m-wa').textContent=s.whatsapp_sent||0;
+    document.getElementById('m-email').textContent=s.email_sent||0;
+    document.getElementById('m-slack').textContent=s.slack_sent||0;
+    document.getElementById('wa-sent-big').textContent=s.whatsapp_sent||0;
+    document.getElementById('wa-fail-big').textContent=s.whatsapp_failed||0;
+    document.getElementById('sl-sent-big').textContent=s.slack_sent||0;
+    document.getElementById('sl-fail-big').textContent=s.slack_failed||0;
+    document.getElementById('wa-status-text').textContent=s.whatsapp_enabled?'Active — INSERT(customer), DELETE, SOFT DELETE':'Disabled';
+    document.getElementById('sl-status-text').textContent=s.slack_enabled?`Active — Channel: ${s.slack_channel||'#db-alerts'}`:'Disabled';
+    if(s.last_event)document.getElementById('last-event').textContent='Last event: '+s.last_event;
+    const counts=await fetch('/api/counts').then(r=>r.json());
+    const tabsBar=document.getElementById('tabs-bar');
+    const existing=new Set([...tabsBar.querySelectorAll('.tab')].map(t=>t.dataset.db||'all'));
+    for(const db of Object.keys(counts)){if(!existing.has(db)){const t=document.createElement('div');t.className='tab';t.dataset.db=db;t.textContent=db.replace('adopt','');t.onclick=()=>switchTab(db);t.id='tab-'+db;tabsBar.appendChild(t);}}
+    document.getElementById('cards').innerHTML=Object.entries(counts).map(([db,cnt])=>`<div class="db-card ${activeDB===db?'active-db':''}" data-db="${db}" onclick="switchTab('${db}')"><div class="db-name">${db}</div><div class="db-count">${cnt}</div><div class="db-label">customers</div></div>`).join('');
+    const db_p=activeDB!=='all'?`&db=${activeDB}`:'';const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
+    const evResp=await fetch(`/api/events?limit=${pageSize}&offset=${pageOffset}${db_p}${ev_p}${sr_p}`).then(r=>r.json());
+    if(evResp.events.length&&evResp.events[0].id>lastEventId){if(soundEnabled)playBeep(660,0.1,0.1);lastEventId=evResp.events[0].id;}
+    allEvents=evResp.events;totalEvents=evResp.total;renderEvents();renderPagination();
+    const tStats=await fetch('/api/table_stats').then(r=>r.json());renderTableStats(tStats);
+  }catch(e){console.error(e);}
 }
-setInterval(load, 1000);
-load();
+setInterval(load,1000);load();
 </script>
 </body>
 </html>"""
@@ -1441,5 +1124,6 @@ if __name__ == "__main__":
     warm_column_cache()
     threading.Thread(target=binlog_monitor, daemon=True).start()
     threading.Thread(target=reset_daily_state, daemon=True).start()
-    print("\nDashboard: http://0.0.0.0:5000\n")
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\nDashboard: http://0.0.0.0:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
