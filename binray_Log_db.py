@@ -13,6 +13,7 @@
 #   ✔ Uptime + connection status
 #   ✔ WhatsApp notifications via Green API
 #   ✔ Email via Resend API (works on Render — no SMTP)
+#   ✔ Slack notifications via Slack Web API
 #
 # REQUIREMENTS:
 #   pip install flask pymysql mysql-replication requests
@@ -36,19 +37,26 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────────────────────
-# Replace your EMAIL_CONFIG with this:
 EMAIL_CONFIG = {
     "enabled":    True,
     "api_key":    "re_QyFu18A9_5mQtDHEUWSrJFHjd5ca3vkuh",
     "from_email": "onboarding@resend.dev",
-    "to_email":   "mbsuthar32@gmail.com",  # ← Your Firefox Relay mask
-    # Use ANY mask you create - they all work!
+    "to_email":   "mbsuthar32@gmail.com",
 }
 
-# Optional: Create multiple masks for different purposes
-# alert@mozmail.com - for urgent alerts
-# logs@mozmail.com - for daily logs  
-# monitor@mozmail.com - for system monitoring
+# ─────────────────────────────────────────────────────────────
+#  SLACK CONFIG
+# ─────────────────────────────────────────────────────────────
+SLACK_CONFIG = {
+    "enabled":            True,
+    "bot_token":          "xoxe.xoxp-1-Mi0yLTk5ODI1NTg2NDDYzNTQtOTk5NTQ3MjM0NjI3My0xMDczMzY1MTIwODMwNi0xMDc2MTkyMjk0MzgwOC1lN2FjOTVlZjliZjgxMDI0MDhmZDgxMjQwYjQ4Y2FhMGMzNmZjNTlmZTk5ODE4YmZkOWQxMjEwNmRkZjA2ZmI1",
+    "channel":            "#db-alerts",           # ← change to your channel, e.g. "#general" or "C0XXXXXXX"
+    "on_insert_customer": True,
+    "on_delete":          True,
+    "on_soft_delete":     True,
+    "on_restore":         False,
+    "on_update":          False,
+}
 
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP CONFIG (Green API)
@@ -111,6 +119,8 @@ STATE = {
         "whatsapp_failed":  0,
         "email_sent":       0,
         "email_failed":     0,
+        "slack_sent":       0,
+        "slack_failed":     0,
         "per_table":        {},
     },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
@@ -182,11 +192,125 @@ def reset_daily_state():
             "total_deletes": 0, "total_soft_deletes": 0,
             "total_restores": 0, "whatsapp_sent": 0,
             "whatsapp_failed": 0, "email_sent": 0,
-            "email_failed": 0, "per_table": {},
+            "email_failed": 0, "slack_sent": 0,
+            "slack_failed": 0, "per_table": {},
         }
         STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
         _event_id = 0
         print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  SLACK via Slack Web API
+# ─────────────────────────────────────────────────────────────
+def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
+    if not SLACK_CONFIG.get("enabled"):
+        return
+
+    bot_token = SLACK_CONFIG.get("bot_token", "")
+    channel   = SLACK_CONFIG.get("channel", "#db-alerts")
+
+    if not bot_token or not channel:
+        print("  ⚠  Slack: config incomplete (bot_token or channel missing)")
+        return
+
+    COLOR_MAP = {
+        "INSERT":      "#22d87a",
+        "UPDATE":      "#f59e0b",
+        "DELETE":      "#f43f5e",
+        "SOFT_DELETE": "#a78bfa",
+        "RESTORE":     "#38bdf8",
+    }
+    ICON_MAP = {
+        "INSERT":      "🎉",
+        "UPDATE":      "✏️",
+        "DELETE":      "🗑️",
+        "SOFT_DELETE": "🚫",
+        "RESTORE":     "♻️",
+    }
+    color = COLOR_MAP.get(event_type, "#6366f1")
+    icon  = ICON_MAP.get(event_type, "📢")
+
+    # Build fields for attachment
+    fields = [
+        {"title": "Database",  "value": db,                       "short": True},
+        {"title": "Table",     "value": f"`{table}`",              "short": True},
+        {"title": "Event",     "value": event_type.replace("_", " "), "short": True},
+        {"title": "Event ID",  "value": f"#{event_id}",            "short": True},
+        {"title": "Time",      "value": now_str(),                  "short": True},
+    ]
+
+    if record:
+        rec_lines = []
+        count = 0
+        for k, v in record.items():
+            v_str = fmt_val(v)
+            if v_str and count < 6:
+                rec_lines.append(f"*{k}:* {v_str}")
+                count += 1
+        if rec_lines:
+            fields.append({"title": "Record Details", "value": "\n".join(rec_lines), "short": False})
+
+    if diff:
+        diff_lines = []
+        for d in diff[:5]:
+            diff_lines.append(f"*{d['field']}:* `{d['before'] or '—'}` → `{d['after'] or '—'}`")
+        if diff_lines:
+            fields.append({"title": "Changes (Before → After)", "value": "\n".join(diff_lines), "short": False})
+
+    if event_type == "DELETE":
+        fields.append({"title": "⚠️ Warning", "value": "This record was *PERMANENTLY DELETED*", "short": False})
+
+    payload = {
+        "channel": channel,
+        "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
+        "attachments": [
+            {
+                "color":       color,
+                "fields":      fields,
+                "footer":      "ADOPT Database Monitor v2",
+                "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
+                "ts":          int(datetime.now().timestamp()),
+            }
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type":  "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            STATE["stats"]["slack_sent"] += 1
+            print(f"  💬  Slack sent [{event_type}] -> {db}.{table}  ts={data.get('ts')}")
+        else:
+            STATE["stats"]["slack_failed"] += 1
+            err = data.get("error", resp.text[:200])
+            print(f"  ✗  Slack failed [{resp.status_code}]: {err}")
+    except Exception as e:
+        STATE["stats"]["slack_failed"] += 1
+        print(f"  ✗  Slack error: {e}")
+
+
+def should_send_slack(event_type, table):
+    cfg = SLACK_CONFIG
+    if event_type == "INSERT" and table in CUSTOMER_TABLES:
+        return cfg.get("on_insert_customer", True)
+    if event_type == "DELETE":
+        return cfg.get("on_delete", True)
+    if event_type == "SOFT_DELETE":
+        return cfg.get("on_soft_delete", True)
+    if event_type == "RESTORE":
+        return cfg.get("on_restore", False)
+    if event_type == "UPDATE":
+        return cfg.get("on_update", False)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -306,14 +430,12 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     }
     accent, bg, subject_label = COLOR_MAP.get(event_type, ("#333", "#fff", "DB Event"))
 
-    # Build record rows HTML
     rows_html = ""
     if record_data:
         for key, value in record_data.items():
             if value is not None:
                 rows_html += f"<tr><td><strong>{key}</strong></td><td>{fmt_val(value)}</td></tr>"
 
-    # Build diff HTML
     diff_html = ""
     if diff_data:
         diff_rows = ""
@@ -470,6 +592,14 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
             daemon=True,
         ).start()
 
+    # ── Slack notification ─────────────────────────────────
+    if should_send_slack(event_type, table) and SLACK_CONFIG.get("enabled"):
+        threading.Thread(
+            target=send_slack,
+            args=(event_type, db, table, record, diff, _event_id),
+            daemon=True,
+        ).start()
+
 
 # ─────────────────────────────────────────────────────────────
 #  COLUMN CACHE
@@ -568,6 +698,20 @@ def check_binlog_status():
         print(f"  ✔  Green API instance: {wa.get('id_instance')}")
         print(f"  ✔  Recipient: {wa.get('recipient_phone')}")
         print(f"  ✔  Alerts: INSERT_CUSTOMER={wa.get('on_insert_customer')} | DELETE={wa.get('on_delete')} | SOFT_DELETE={wa.get('on_soft_delete')}")
+    print("="*70 + "\n")
+
+    # Slack config status
+    print("="*70)
+    print("  SLACK STATUS")
+    print("="*70)
+    sl = SLACK_CONFIG
+    if not sl.get("enabled"):
+        print("  ✗  Slack DISABLED")
+    else:
+        token = sl.get("bot_token", "")
+        print(f"  ✔  Channel: {sl.get('channel')}")
+        print(f"  ✔  Token: {token[:12]}...{token[-4:] if len(token) > 16 else '(too short?)'}")
+        print(f"  ✔  Alerts: INSERT_CUSTOMER={sl.get('on_insert_customer')} | DELETE={sl.get('on_delete')} | SOFT_DELETE={sl.get('on_soft_delete')}")
     print("="*70 + "\n")
 
 
@@ -715,6 +859,10 @@ def api_stats():
         "whatsapp_enabled": WHATSAPP_CONFIG.get("enabled", False),
         "whatsapp_sent":    STATE["stats"]["whatsapp_sent"],
         "whatsapp_failed":  STATE["stats"]["whatsapp_failed"],
+        "slack_enabled":    SLACK_CONFIG.get("enabled", False),
+        "slack_sent":       STATE["stats"]["slack_sent"],
+        "slack_failed":     STATE["stats"]["slack_failed"],
+        "slack_channel":    SLACK_CONFIG.get("channel", ""),
         "total_events":     len(STATE["events"]),
         "binlog_file":      STATE["binlog_file"],
         "binlog_position":  STATE["binlog_position"],
@@ -783,7 +931,7 @@ HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
       --muted:#4a5a75;--ins:#22d87a;--upd:#f59e0b;--del:#f43f5e;
-      --rest:#38bdf8;--soft:#a78bfa;--acc:#6366f1;--wa:#25d366}
+      --rest:#38bdf8;--soft:#a78bfa;--acc:#6366f1;--wa:#25d366;--sl:#4a154b;--sl2:#e01e5a}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;min-height:100vh}
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -802,6 +950,7 @@ header{display:flex;align-items:center;justify-content:space-between;
 .b-em{background:#f59e0b18;color:#f59e0b;border:1px solid #f59e0b44}
 .b-up{background:#38bdf818;color:#38bdf8;border:1px solid #38bdf844}
 .b-wa{background:#25d36618;color:#25d366;border:1px solid #25d36644}
+.b-sl{background:#e01e5a18;color:#e01e5a;border:1px solid #e01e5a44}
 .pulse{display:inline-block;width:6px;height:6px;border-radius:50%;
        background:#22d87a;margin-right:4px;animation:blink 1.4s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
@@ -823,7 +972,7 @@ header{display:flex;align-items:center;justify-content:space-between;
 .metric-val{font-size:22px;font-weight:700;font-family:'Syne',sans-serif}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
-.c-em{color:#f59e0b}
+.c-em{color:#f59e0b}.c-sl{color:#e01e5a}
 .tabs-bar{display:flex;gap:0;padding:0 24px;border-bottom:1px solid var(--border);
           overflow-x:auto;background:var(--surf)}
 .tab{padding:10px 16px;font-size:11px;cursor:pointer;color:var(--muted);
@@ -895,6 +1044,23 @@ header{display:flex;align-items:center;justify-content:space-between;
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
+.notif-panels{display:flex;gap:12px;margin:0 24px 16px;flex-wrap:wrap}
+.notif-panel{flex:1;min-width:260px;background:var(--surf);border-radius:10px;
+             padding:14px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.wa-panel{border:1px solid #25d36644}
+.sl-panel{border:1px solid #e01e5a44}
+.notif-icon{font-size:24px}
+.notif-info{flex:1}
+.notif-title{font-size:12px;font-weight:700;margin-bottom:3px}
+.wa-title{color:#25d366}
+.sl-title{color:#e01e5a}
+.notif-sub{font-size:10px;color:var(--muted)}
+.notif-stats{display:flex;gap:14px}
+.notif-stat{text-align:center}
+.notif-stat-val{font-size:18px;font-weight:700;font-family:'Syne',sans-serif}
+.wa-stat-val{color:#25d366}
+.sl-stat-val{color:#e01e5a}
+.notif-stat-lbl{font-size:9px;color:var(--muted)}
 .modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;
                align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
@@ -924,16 +1090,6 @@ header{display:flex;align-items:center;justify-content:space-between;
 .rec-table td:last-child{color:#fff;word-break:break-word}
 .footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);
             border-top:1px solid var(--border);display:flex;justify-content:space-between}
-.wa-panel{margin:0 24px 16px;background:var(--surf);border:1px solid #25d36644;
-          border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.wa-icon{font-size:24px}
-.wa-info{flex:1}
-.wa-title{font-size:12px;font-weight:700;color:#25d366;margin-bottom:3px}
-.wa-sub{font-size:10px;color:var(--muted)}
-.wa-stats{display:flex;gap:14px}
-.wa-stat{text-align:center}
-.wa-stat-val{font-size:18px;font-weight:700;font-family:'Syne',sans-serif;color:#25d366}
-.wa-stat-lbl{font-size:9px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -944,6 +1100,7 @@ header{display:flex;align-items:center;justify-content:space-between;
     <span class="badge b-bl">⚡ BINLOG CDC</span>
     <span class="badge b-em" id="email-badge">📧 EMAIL ON</span>
     <span class="badge b-wa" id="wa-badge">📱 WA ON</span>
+    <span class="badge b-sl" id="sl-badge">💬 SLACK ON</span>
     <span class="badge b-up" id="uptime-badge">⏱ 0h 0m</span>
   </div>
 </header>
@@ -973,17 +1130,34 @@ header{display:flex;align-items:center;justify-content:space-between;
     <div class="metric"><div class="metric-label">Restores</div><div class="metric-val c-rest" id="m-rest">0</div></div>
     <div class="metric"><div class="metric-label">📱 WA Sent</div><div class="metric-val c-wa" id="m-wa">0</div></div>
     <div class="metric"><div class="metric-label">📧 Email Sent</div><div class="metric-val c-em" id="m-email">0</div></div>
+    <div class="metric"><div class="metric-label">💬 Slack Sent</div><div class="metric-val c-sl" id="m-slack">0</div></div>
   </div>
 
-  <div class="wa-panel" id="wa-panel">
-    <div class="wa-icon">📱</div>
-    <div class="wa-info">
-      <div class="wa-title">WhatsApp Notifications (Green API)</div>
-      <div class="wa-sub" id="wa-status-text">Checking status...</div>
+  <div class="notif-panels">
+    <!-- WhatsApp Panel -->
+    <div class="notif-panel wa-panel">
+      <div class="notif-icon">📱</div>
+      <div class="notif-info">
+        <div class="notif-title wa-title">WhatsApp (Green API)</div>
+        <div class="notif-sub" id="wa-status-text">Checking status...</div>
+      </div>
+      <div class="notif-stats">
+        <div class="notif-stat"><div class="notif-stat-val wa-stat-val" id="wa-sent-big">0</div><div class="notif-stat-lbl">Sent</div></div>
+        <div class="notif-stat"><div class="notif-stat-val" style="color:#f43f5e" id="wa-fail-big">0</div><div class="notif-stat-lbl">Failed</div></div>
+      </div>
     </div>
-    <div class="wa-stats">
-      <div class="wa-stat"><div class="wa-stat-val" id="wa-sent-big">0</div><div class="wa-stat-lbl">Sent</div></div>
-      <div class="wa-stat"><div class="wa-stat-val" style="color:#f43f5e" id="wa-fail-big">0</div><div class="wa-stat-lbl">Failed</div></div>
+
+    <!-- Slack Panel -->
+    <div class="notif-panel sl-panel">
+      <div class="notif-icon">💬</div>
+      <div class="notif-info">
+        <div class="notif-title sl-title">Slack Notifications</div>
+        <div class="notif-sub" id="sl-status-text">Checking status...</div>
+      </div>
+      <div class="notif-stats">
+        <div class="notif-stat"><div class="notif-stat-val sl-stat-val" id="sl-sent-big">0</div><div class="notif-stat-lbl">Sent</div></div>
+        <div class="notif-stat"><div class="notif-stat-val" style="color:#f43f5e" id="sl-fail-big">0</div><div class="notif-stat-lbl">Failed</div></div>
+      </div>
     </div>
   </div>
 
@@ -1183,6 +1357,7 @@ async function load(){
     }
     document.getElementById('email-badge').textContent  = s.email_enabled ? '📧 EMAIL ON' : '📧 EMAIL OFF';
     document.getElementById('wa-badge').textContent     = s.whatsapp_enabled ? '📱 WA ON' : '📱 WA OFF';
+    document.getElementById('sl-badge').textContent     = s.slack_enabled ? '💬 SLACK ON' : '💬 SLACK OFF';
     document.getElementById('uptime-badge').textContent = `⏱ ${s.uptime}`;
     document.getElementById('i-binlog').textContent = s.binlog_file || '—';
     document.getElementById('i-pos').textContent    = s.binlog_position || '—';
@@ -1198,10 +1373,16 @@ async function load(){
     document.getElementById('m-rest').textContent  = s.total_restores;
     document.getElementById('m-wa').textContent    = s.whatsapp_sent || 0;
     document.getElementById('m-email').textContent = s.email_sent || 0;
+    document.getElementById('m-slack').textContent = s.slack_sent || 0;
     document.getElementById('wa-sent-big').textContent = s.whatsapp_sent || 0;
     document.getElementById('wa-fail-big').textContent = s.whatsapp_failed || 0;
+    document.getElementById('sl-sent-big').textContent = s.slack_sent || 0;
+    document.getElementById('sl-fail-big').textContent = s.slack_failed || 0;
     document.getElementById('wa-status-text').textContent = s.whatsapp_enabled
       ? `Active — Sending alerts for: INSERT (customer), DELETE, SOFT DELETE`
+      : `Disabled`;
+    document.getElementById('sl-status-text').textContent = s.slack_enabled
+      ? `Active — Channel: ${s.slack_channel || '#db-alerts'} | INSERT (customer), DELETE, SOFT DELETE`
       : `Disabled`;
     if(s.last_event) document.getElementById('last-event').textContent = 'Last event: '+s.last_event;
     const counts = await fetch('/api/counts').then(r=>r.json());
