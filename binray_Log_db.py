@@ -1,22 +1,7 @@
 # ============================================================
 # ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v2
-# NEW FEATURES:
-#   ✔ MySQL user + IP address capture
-#   ✔ Before vs After comparison for UPDATE
-#   ✔ Binlog file + position tracking
-#   ✔ Row count stats per table
-#   ✔ Search/filter by table or keyword
-#   ✔ Export events to CSV
-#   ✔ Sound alert on new events
-#   ✔ Per-database tab view
-#   ✔ Event detail popup on click
-#   ✔ Uptime + connection status
-#   ✔ WhatsApp notifications via Green API
-#   ✔ Email via Resend API (works on Render — no SMTP)
-#   ✔ Slack notifications via Slack Web API
-#
-# REQUIREMENTS:
-#   pip install flask pymysql mysql-replication requests
+# FIXED: Binlog position persistence + event deduplication
+#        prevents replayed DELETE events on reconnect
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq
@@ -26,6 +11,7 @@ import time
 import csv
 import io
 import os
+import json
 import requests
 from datetime import datetime
 
@@ -93,6 +79,67 @@ EXCLUDE_TABLES = {
 }
 
 # ─────────────────────────────────────────────────────────────
+#  BINLOG POSITION PERSISTENCE
+#  Saves the last processed binlog file+position to disk so
+#  on reconnect we resume exactly where we left off — this
+#  prevents replaying old events (especially old DELETEs).
+# ─────────────────────────────────────────────────────────────
+POSITION_FILE = "/tmp/adopt_binlog_position.json"
+
+def save_binlog_position(log_file: str, log_pos: int):
+    """Persist the current binlog position to disk."""
+    try:
+        with open(POSITION_FILE, "w") as f:
+            json.dump({"log_file": log_file, "log_pos": log_pos}, f)
+    except Exception as e:
+        print(f"  ⚠  Could not save binlog position: {e}")
+
+def load_binlog_position():
+    """Load the last saved binlog position. Returns (None, None) if not found."""
+    try:
+        if os.path.exists(POSITION_FILE):
+            with open(POSITION_FILE, "r") as f:
+                data = json.load(f)
+                log_file = data.get("log_file")
+                log_pos  = data.get("log_pos")
+                if log_file and log_pos:
+                    print(f"  ✔  Resuming from saved position: {log_file} @ {log_pos}")
+                    return log_file, int(log_pos)
+    except Exception as e:
+        print(f"  ⚠  Could not load binlog position: {e}")
+    return None, None
+
+# ─────────────────────────────────────────────────────────────
+#  EVENT DEDUPLICATION
+#  Tracks a rolling window of recently seen (binlog_pos, db,
+#  table, event_type) tuples so that if the stream is replayed
+#  briefly on reconnect, duplicate events are silently dropped.
+# ─────────────────────────────────────────────────────────────
+_seen_events = set()       # set of (log_pos, db, table, event_type, row_hash)
+_seen_events_lock = threading.Lock()
+MAX_SEEN_EVENTS = 10_000   # cap memory usage
+
+def is_duplicate_event(log_pos: int, db: str, table: str, event_type: str, row: dict) -> bool:
+    """Return True if this exact event was already processed."""
+    # Build a lightweight fingerprint from the row's key values
+    try:
+        row_repr = str(sorted(row.items())[:8])   # first 8 fields for speed
+    except Exception:
+        row_repr = ""
+    key = (log_pos, db, table, event_type, row_repr)
+    with _seen_events_lock:
+        if key in _seen_events:
+            return True
+        _seen_events.add(key)
+        # Trim the set if it grows too large
+        if len(_seen_events) > MAX_SEEN_EVENTS:
+            # Remove a random chunk (sets don't support slicing)
+            remove = list(_seen_events)[:MAX_SEEN_EVENTS // 2]
+            for k in remove:
+                _seen_events.discard(k)
+    return False
+
+# ─────────────────────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────────────────────
 STATE = {
@@ -105,18 +152,19 @@ STATE = {
     "mysql_user":      MYSQL_SETTINGS["user"],
     "mysql_host":      MYSQL_SETTINGS["host"],
     "stats": {
-        "total_inserts":      0,
-        "total_updates":      0,
-        "total_deletes":      0,
-        "total_soft_deletes": 0,
-        "total_restores":     0,
-        "whatsapp_sent":      0,
-        "whatsapp_failed":    0,
-        "email_sent":         0,
-        "email_failed":       0,
-        "slack_sent":         0,
-        "slack_failed":       0,
-        "per_table":          {},
+        "total_inserts":        0,
+        "total_updates":        0,
+        "total_deletes":        0,
+        "total_soft_deletes":   0,
+        "total_restores":       0,
+        "fake_deletes_blocked": 0,
+        "whatsapp_sent":        0,
+        "whatsapp_failed":      0,
+        "email_sent":           0,
+        "email_failed":         0,
+        "slack_sent":           0,
+        "slack_failed":         0,
+        "per_table":            {},
     },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
@@ -185,13 +233,17 @@ def reset_daily_state():
         STATE["stats"] = {
             "total_inserts": 0, "total_updates": 0,
             "total_deletes": 0, "total_soft_deletes": 0,
-            "total_restores": 0, "whatsapp_sent": 0,
+            "total_restores": 0, "fake_deletes_blocked": 0,
+            "whatsapp_sent": 0,
             "whatsapp_failed": 0, "email_sent": 0,
             "email_failed": 0, "slack_sent": 0,
             "slack_failed": 0, "per_table": {},
         }
         STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
         _event_id = 0
+        # Also clear dedup cache on daily reset
+        with _seen_events_lock:
+            _seen_events.clear()
         print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
 
 
@@ -446,6 +498,104 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
 
 
 # ─────────────────────────────────────────────────────────────
+#  DELETE DOUBLE-VERIFICATION
+#  Binlog se DELETE aaya → 4 sec wait → MySQL mein check karo
+#  → record exist karta hai? → FAKE (binlog replay) → ignore
+#  → record nahi mila?      → REAL DELETE → confirm karke alert
+# ─────────────────────────────────────────────────────────────
+DELETE_VERIFY_DELAY = 4   # seconds to wait before checking
+
+def _find_primary_key(db: str, table: str, record: dict):
+    """
+    Try to find the primary key column + value for this record.
+    First looks for common PK names, then queries information_schema.
+    Returns (pk_col, pk_val) or (None, None).
+    """
+    # 1. Common PK column names — check in record first (fast path)
+    for candidate in ("id", "ID", "Id", f"{table}id", f"{table}Id",
+                      f"{table}_id", "uuid", "UUID"):
+        if candidate in record and record[candidate]:
+            return candidate, record[candidate]
+
+    # 2. Ask information_schema for the actual PK
+    try:
+        conn = pymysql.connect(**{**MYSQL_SETTINGS,
+                                   "db": db,
+                                   "cursorclass": pymysql.cursors.DictCursor,
+                                   "connect_timeout": 5})
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND CONSTRAINT_NAME='PRIMARY' "
+            "ORDER BY ORDINAL_POSITION LIMIT 1",
+            (db, table)
+        )
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row:
+            pk_col = row["COLUMN_NAME"]
+            pk_val = record.get(pk_col)
+            if pk_val:
+                return pk_col, pk_val
+    except Exception as e:
+        print(f"  ⚠  PK lookup error for {db}.{table}: {e}")
+
+    return None, None
+
+
+def verify_delete_and_push(db: str, table: str, details: str,
+                            record: dict, meta: dict):
+    """
+    Called in a background thread for every DELETE event.
+    Waits DELETE_VERIFY_DELAY seconds, then queries MySQL to confirm
+    the record is actually gone. Only calls push_event if confirmed.
+    """
+    pk_col, pk_val = _find_primary_key(db, table, record)
+
+    # ── Step 1: wait a few seconds so any in-flight rollback can settle ──
+    time.sleep(DELETE_VERIFY_DELAY)
+
+    # ── Step 2: if we have a PK, do a real DB lookup ──
+    if pk_col and pk_val:
+        try:
+            conn = pymysql.connect(**{**MYSQL_SETTINGS,
+                                       "db": db,
+                                       "cursorclass": pymysql.cursors.DictCursor,
+                                       "connect_timeout": 5})
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT 1 FROM `{table}` WHERE `{pk_col}` = %s LIMIT 1",
+                (pk_val,)
+            )
+            still_exists = cur.fetchone() is not None
+            cur.close(); conn.close()
+
+            if still_exists:
+                # Record is still in DB → this was a binlog replay / false alarm
+                print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
+                      f"[{pk_col}={pk_val}] still exists in DB (binlog replay)")
+                STATE["stats"]["fake_deletes_blocked"] = \
+                    STATE["stats"].get("fake_deletes_blocked", 0) + 1
+                return   # ← do NOT push, do NOT alert
+
+            # Record truly gone → confirmed real delete
+            print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
+            meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found in DB"
+
+        except Exception as e:
+            # DB check failed → still push but mark as unverified
+            print(f"  ⚠  Delete verification query failed ({e}), pushing as UNVERIFIED")
+            meta["Verification"] = f"⚠️ Unverified — DB check failed: {e}"
+    else:
+        # No PK found → can't verify, push with warning
+        print(f"  ⚠  Delete verification skipped — no PK found for {db}.{table}")
+        meta["Verification"] = "⚠️ Unverified — no primary key found"
+
+    # ── Step 3: Push the confirmed (or unverifiable) delete ──
+    push_event("DELETE", db, table, details, record=record, meta=meta)
+
+
+# ─────────────────────────────────────────────────────────────
 #  PUSH EVENT
 # ─────────────────────────────────────────────────────────────
 def push_event(event_type, db, table, details, record=None, diff=None, meta=None):
@@ -616,7 +766,7 @@ def check_binlog_status():
 
 
 # ─────────────────────────────────────────────────────────────
-#  BINLOG MONITOR THREAD
+#  BINLOG MONITOR THREAD  ← KEY FIXES HERE
 # ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
@@ -626,16 +776,44 @@ def binlog_monitor():
     while True:
         stream = None
         try:
-            stream = BinLogStreamReader(
+            # ── FIX 1: Load the saved position so we never re-read old events ──
+            saved_log_file, saved_log_pos = load_binlog_position()
+
+            stream_kwargs = dict(
                 connection_settings     = MYSQL_SETTINGS,
                 ctl_connection_settings = MYSQL_SETTINGS,
                 server_id               = 100,
                 only_events             = [WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, RotateEvent],
                 only_schemas            = list(WATCH_DATABASES),
-                resume_stream           = True,
                 blocking                = True,
                 freeze_schema           = False,
+                # ── FIX 2: resume_stream=False — we control the position manually ──
+                resume_stream           = False,
             )
+
+            if saved_log_file and saved_log_pos:
+                # Resume exactly where we stopped
+                stream_kwargs["log_file"] = saved_log_file
+                stream_kwargs["log_pos"]  = saved_log_pos
+                print(f"  ↺  Resuming binlog from {saved_log_file} @ {saved_log_pos}")
+            else:
+                # First run: start from the CURRENT (live) position so we
+                # don't replay any historical events at all
+                try:
+                    conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
+                    cur  = conn.cursor()
+                    cur.execute("SHOW MASTER STATUS")
+                    master = cur.fetchone()
+                    cur.close(); conn.close()
+                    if master:
+                        vals = list(master.values())
+                        stream_kwargs["log_file"] = vals[0]
+                        stream_kwargs["log_pos"]  = vals[1]
+                        print(f"  ✔  First run — starting from live position: {vals[0]} @ {vals[1]}")
+                except Exception as e:
+                    print(f"  ⚠  Could not fetch MASTER STATUS, streaming from default: {e}")
+
+            stream = BinLogStreamReader(**stream_kwargs)
             print("  ✔  Connected to binlog stream\n")
             STATE["ready"] = True
 
@@ -643,6 +821,7 @@ def binlog_monitor():
                 if isinstance(binlog_event, RotateEvent):
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
+                    save_binlog_position(STATE["binlog_file"], STATE["binlog_position"])
                     continue
 
                 db    = binlog_event.schema
@@ -650,11 +829,19 @@ def binlog_monitor():
                 if table in EXCLUDE_TABLES or table.startswith("vw"):
                     continue
 
-                STATE["binlog_position"] = binlog_event.packet.log_pos
+                current_log_pos = binlog_event.packet.log_pos
+                STATE["binlog_position"] = current_log_pos
+
+                # ── FIX 3: Save position after every event batch ──
+                save_binlog_position(STATE["binlog_file"], current_log_pos)
 
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
+                        # ── FIX 4: Dedup check ──
+                        if is_duplicate_event(current_log_pos, db, table, "INSERT", values):
+                            print(f"  ⚠  Skipping duplicate INSERT {db}.{table} @ pos {current_log_pos}")
+                            continue
                         detail = format_row(values)
                         print(f"  [INSERT] {db}.{table}")
                         push_event("INSERT", db, table, detail, record=values)
@@ -662,14 +849,33 @@ def binlog_monitor():
                 elif isinstance(binlog_event, DeleteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
+                        # ── Dedup check ──
+                        if is_duplicate_event(current_log_pos, db, table, "DELETE", values):
+                            print(f"  ⚠  Skipping duplicate DELETE {db}.{table} @ pos {current_log_pos}")
+                            continue
                         detail = format_row(values)
-                        print(f"  [DELETE] {db}.{table}")
-                        push_event("DELETE", db, table, detail, record=values)
+                        print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
+                        # ── DOUBLE VERIFICATION: background thread waits then checks DB ──
+                        meta_snapshot = {
+                            "Binlog File":     STATE["binlog_file"],
+                            "Binlog Position": str(current_log_pos),
+                            "MySQL User":      STATE["mysql_user"],
+                            "MySQL Host":      STATE["mysql_host"],
+                        }
+                        threading.Thread(
+                            target=verify_delete_and_push,
+                            args=(db, table, detail, dict(values), meta_snapshot),
+                            daemon=True
+                        ).start()
 
                 elif isinstance(binlog_event, UpdateRowsEvent):
                     for row in binlog_event.rows:
                         before = resolve_columns(db, table, row["before_values"])
                         after  = resolve_columns(db, table, row["after_values"])
+                        # ── FIX 4: Dedup check (use after-values as fingerprint) ──
+                        if is_duplicate_event(current_log_pos, db, table, "UPDATE", after):
+                            print(f"  ⚠  Skipping duplicate UPDATE {db}.{table} @ pos {current_log_pos}")
+                            continue
                         diff   = build_diff(before, after)
 
                         is_del_before = str(before.get("is_delete", "")).strip()
@@ -739,26 +945,27 @@ def api_counts():
 @app.route("/api/stats")
 def api_stats():
     return jsonify({
-        "ready":            STATE["ready"],
-        "databases":        len(WATCH_DATABASES),
-        "last_event":       STATE["last_event"],
-        "email_enabled":    EMAIL_CONFIG.get("enabled"),
-        "email_sent":       STATE["stats"]["email_sent"],
-        "email_failed":     STATE["stats"]["email_failed"],
-        "whatsapp_enabled": WHATSAPP_CONFIG.get("enabled", False),
-        "whatsapp_sent":    STATE["stats"]["whatsapp_sent"],
-        "whatsapp_failed":  STATE["stats"]["whatsapp_failed"],
-        "slack_enabled":    SLACK_CONFIG.get("enabled", False),
-        "slack_sent":       STATE["stats"]["slack_sent"],
-        "slack_failed":     STATE["stats"]["slack_failed"],
-        "slack_channel":    SLACK_CONFIG.get("channel", ""),
-        "total_events":     len(STATE["events"]),
-        "binlog_file":      STATE["binlog_file"],
-        "binlog_position":  STATE["binlog_position"],
-        "mysql_user":       STATE["mysql_user"],
-        "mysql_host":       STATE["mysql_host"],
-        "uptime":           uptime_str(),
-        "start_time":       STATE["start_time"],
+        "ready":                 STATE["ready"],
+        "databases":             len(WATCH_DATABASES),
+        "last_event":            STATE["last_event"],
+        "email_enabled":         EMAIL_CONFIG.get("enabled"),
+        "email_sent":            STATE["stats"]["email_sent"],
+        "email_failed":          STATE["stats"]["email_failed"],
+        "whatsapp_enabled":      WHATSAPP_CONFIG.get("enabled", False),
+        "whatsapp_sent":         STATE["stats"]["whatsapp_sent"],
+        "whatsapp_failed":       STATE["stats"]["whatsapp_failed"],
+        "slack_enabled":         SLACK_CONFIG.get("enabled", False),
+        "slack_sent":            STATE["stats"]["slack_sent"],
+        "slack_failed":          STATE["stats"]["slack_failed"],
+        "slack_channel":         SLACK_CONFIG.get("channel", ""),
+        "total_events":          len(STATE["events"]),
+        "fake_deletes_blocked":  STATE["stats"].get("fake_deletes_blocked", 0),
+        "binlog_file":           STATE["binlog_file"],
+        "binlog_position":       STATE["binlog_position"],
+        "mysql_user":            STATE["mysql_user"],
+        "mysql_host":            STATE["mysql_host"],
+        "uptime":                uptime_str(),
+        "start_time":            STATE["start_time"],
         **STATE["stats"],
     })
 
@@ -801,7 +1008,7 @@ def api_export_csv():
 
 
 # ─────────────────────────────────────────────────────────────
-#  DASHBOARD HTML  (same as old working code + Slack panel added)
+#  DASHBOARD HTML
 # ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -973,6 +1180,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
     <div class="metric"><div class="metric-label">📱 WA Sent</div><div class="metric-val c-wa" id="m-wa">0</div></div>
     <div class="metric"><div class="metric-label">📧 Email Sent</div><div class="metric-val c-em" id="m-email">0</div></div>
     <div class="metric"><div class="metric-label">💬 Slack Sent</div><div class="metric-val c-sl" id="m-slack">0</div></div>
+    <div class="metric"><div class="metric-label">🛡️ Fake Del Blocked</div><div class="metric-val" style="color:#f97316" id="m-fake">0</div></div>
   </div>
 
   <div class="notif-row">
@@ -1086,6 +1294,7 @@ async function load(){
     document.getElementById('m-wa').textContent=s.whatsapp_sent||0;
     document.getElementById('m-email').textContent=s.email_sent||0;
     document.getElementById('m-slack').textContent=s.slack_sent||0;
+    document.getElementById('m-fake').textContent=s.fake_deletes_blocked||0;
     document.getElementById('wa-sent-big').textContent=s.whatsapp_sent||0;
     document.getElementById('wa-fail-big').textContent=s.whatsapp_failed||0;
     document.getElementById('sl-sent-big').textContent=s.slack_sent||0;
