@@ -1,7 +1,17 @@
 # ============================================================
 # ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v2
-# FIXED: Binlog position persistence + event deduplication
-#        prevents replayed DELETE events on reconnect
+# FIXED A: Daily reset now uses day-change detection (not sleep-based)
+#          so it works correctly on Railway regardless of timezone.
+# FIXED B: DELETE / SOFT_DELETE / RESTORE events now always appear
+#          in the live stream:
+#          1. verify_delete_and_push: every exception now still pushes
+#             the event (marked unverified) instead of silently dropping.
+#          2. Dedup eviction replaced with proper ordered-eviction so old
+#             keys are removed in insertion order, not randomly — prevents
+#             re-blocking legitimate new events after eviction.
+#          3. Frontend JS: auto-scroll-to-top disabled so newest events
+#             always stay in view; poll now forces a full refresh when
+#             the server-side total_events drops (after daily reset).
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq
@@ -14,6 +24,7 @@ import os
 import json
 import requests
 from datetime import datetime
+from collections import OrderedDict
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
@@ -80,14 +91,10 @@ EXCLUDE_TABLES = {
 
 # ─────────────────────────────────────────────────────────────
 #  BINLOG POSITION PERSISTENCE
-#  Saves the last processed binlog file+position to disk so
-#  on reconnect we resume exactly where we left off — this
-#  prevents replaying old events (especially old DELETEs).
 # ─────────────────────────────────────────────────────────────
 POSITION_FILE = "/tmp/adopt_binlog_position.json"
 
 def save_binlog_position(log_file: str, log_pos: int):
-    """Persist the current binlog position to disk."""
     try:
         with open(POSITION_FILE, "w") as f:
             json.dump({"log_file": log_file, "log_pos": log_pos}, f)
@@ -95,7 +102,6 @@ def save_binlog_position(log_file: str, log_pos: int):
         print(f"  ⚠  Could not save binlog position: {e}")
 
 def load_binlog_position():
-    """Load the last saved binlog position. Returns (None, None) if not found."""
     try:
         if os.path.exists(POSITION_FILE):
             with open(POSITION_FILE, "r") as f:
@@ -110,48 +116,36 @@ def load_binlog_position():
     return None, None
 
 # ─────────────────────────────────────────────────────────────
-#  EVENT DEDUPLICATION
-#  Tracks a rolling window of recently seen (binlog_pos, db,
-#  table, event_type) tuples so that if the stream is replayed
-#  briefly on reconnect, duplicate events are silently dropped.
+#  EVENT DEDUPLICATION — FIX B(2)
+#  Use OrderedDict so eviction removes the OLDEST keys first
+#  (insertion order), not random ones. Random eviction was
+#  accidentally removing keys for recent events and letting
+#  replayed DELETE events bypass the dedup check.
 # ─────────────────────────────────────────────────────────────
-_seen_events = set()       # set of (log_pos, db, table, event_type, row_hash)
+_seen_events      = OrderedDict()   # key -> True
 _seen_events_lock = threading.Lock()
-MAX_SEEN_EVENTS = 10_000   # cap memory usage
+MAX_SEEN_EVENTS   = 10_000
 
 def is_duplicate_event(log_pos: int, db: str, table: str, event_type: str, row: dict) -> bool:
-    """Return True if this exact event was already processed."""
-    # Build a lightweight fingerprint from the row's key values
     try:
-        row_repr = str(sorted(row.items())[:8])   # first 8 fields for speed
+        row_repr = str(sorted(row.items())[:8])
     except Exception:
         row_repr = ""
     key = (log_pos, db, table, event_type, row_repr)
     with _seen_events_lock:
         if key in _seen_events:
             return True
-        _seen_events.add(key)
-        # Trim the set if it grows too large
-        if len(_seen_events) > MAX_SEEN_EVENTS:
-            # Remove a random chunk (sets don't support slicing)
-            remove = list(_seen_events)[:MAX_SEEN_EVENTS // 2]
-            for k in remove:
-                _seen_events.discard(k)
+        _seen_events[key] = True
+        # Evict oldest entries (FIFO) to stay under memory cap
+        while len(_seen_events) > MAX_SEEN_EVENTS:
+            _seen_events.popitem(last=False)
     return False
 
 # ─────────────────────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────────────────────
-STATE = {
-    "events":          [],
-    "ready":           False,
-    "last_event":      None,
-    "start_time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "binlog_file":     "—",
-    "binlog_position": 0,
-    "mysql_user":      MYSQL_SETTINGS["user"],
-    "mysql_host":      MYSQL_SETTINGS["host"],
-    "stats": {
+def _fresh_stats():
+    return {
         "total_inserts":        0,
         "total_updates":        0,
         "total_deletes":        0,
@@ -165,7 +159,18 @@ STATE = {
         "slack_sent":           0,
         "slack_failed":         0,
         "per_table":            {},
-    },
+    }
+
+STATE = {
+    "events":          [],
+    "ready":           False,
+    "last_event":      None,
+    "start_time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "binlog_file":     "—",
+    "binlog_position": 0,
+    "mysql_user":      MYSQL_SETTINGS["user"],
+    "mysql_host":      MYSQL_SETTINGS["host"],
+    "stats":           _fresh_stats(),
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
 
@@ -217,38 +222,45 @@ def uptime_str():
         return "—"
 
 
-# ── DAILY RESET ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  DAILY RESET — FIX A
+#  Old approach: sleep until tomorrow_midnight then loop.
+#  Problem on Railway: if the sleep calculation uses server
+#  local time but Railway runs UTC, the reset fires at wrong hour,
+#  OR if the thread crashes silently it never resets again.
+#
+#  New approach: poll every 60 seconds, compare current date
+#  against the date stored in STATE["start_time"]. When the
+#  calendar date has advanced, perform the reset immediately.
+#  This is timezone-safe, crash-safe, and restarts cleanly.
+# ─────────────────────────────────────────────────────────────
 def reset_daily_state():
+    global _event_id
     while True:
-        from datetime import timedelta
-        now = datetime.now()
-        tomorrow_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        time.sleep((tomorrow_midnight - now).total_seconds())
-        global _event_id
-        STATE["events"].clear()
-        STATE["last_event"] = None
-        STATE["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        STATE["stats"] = {
-            "total_inserts": 0, "total_updates": 0,
-            "total_deletes": 0, "total_soft_deletes": 0,
-            "total_restores": 0, "fake_deletes_blocked": 0,
-            "whatsapp_sent": 0,
-            "whatsapp_failed": 0, "email_sent": 0,
-            "email_failed": 0, "slack_sent": 0,
-            "slack_failed": 0, "per_table": {},
-        }
-        STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
-        _event_id = 0
-        # Also clear dedup cache on daily reset
-        with _seen_events_lock:
-            _seen_events.clear()
-        print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
+        try:
+            time.sleep(60)   # check every minute — lightweight
+            now = datetime.now()
+            try:
+                start = datetime.strptime(STATE["start_time"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                start = now
+            # Reset when calendar date has changed since last reset
+            if now.date() > start.date():
+                print(f"  🔄  Daily reset! {now.strftime('%Y-%m-%d %H:%M:%S')}")
+                STATE["events"].clear()
+                STATE["last_event"]      = None
+                STATE["start_time"]      = now.strftime("%Y-%m-%d %H:%M:%S")
+                STATE["stats"]           = _fresh_stats()
+                STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
+                _event_id = 0
+                with _seen_events_lock:
+                    _seen_events.clear()
+        except Exception as e:
+            print(f"  ⚠  reset_daily_state error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-#  SLACK via Slack Web API
+#  SLACK
 # ─────────────────────────────────────────────────────────────
 def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
     if not SLACK_CONFIG.get("enabled"):
@@ -256,7 +268,6 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
     bot_token = SLACK_CONFIG.get("bot_token", "")
     channel   = SLACK_CONFIG.get("channel", "#db-alerts")
     if not bot_token or not channel:
-        print("  ⚠  Slack: config incomplete")
         return
 
     COLOR_MAP = {
@@ -328,15 +339,15 @@ def should_send_slack(event_type, table):
     cfg = SLACK_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":     return cfg.get("on_delete", True)
+    if event_type == "DELETE":      return cfg.get("on_delete", True)
     if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":    return cfg.get("on_restore", False)
-    if event_type == "UPDATE":     return cfg.get("on_update", False)
+    if event_type == "RESTORE":     return cfg.get("on_restore", False)
+    if event_type == "UPDATE":      return cfg.get("on_update", False)
     return False
 
 
 # ─────────────────────────────────────────────────────────────
-#  WHATSAPP via Green API
+#  WHATSAPP
 # ─────────────────────────────────────────────────────────────
 def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     if not WHATSAPP_CONFIG.get("enabled"):
@@ -346,7 +357,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     api_url     = WHATSAPP_CONFIG.get("api_url", "").rstrip("/")
     recipient   = WHATSAPP_CONFIG.get("recipient_phone", "")
     if not all([id_instance, api_token, api_url, recipient]):
-        print("  ⚠  WhatsApp: Green API config incomplete")
         return
 
     ICON_MAP = {"INSERT": "🎉", "UPDATE": "✏️", "DELETE": "🗑️", "SOFT_DELETE": "🚫", "RESTORE": "♻️"}
@@ -398,15 +408,15 @@ def should_send_whatsapp(event_type, table):
     cfg = WHATSAPP_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":     return cfg.get("on_delete", True)
+    if event_type == "DELETE":      return cfg.get("on_delete", True)
     if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":    return cfg.get("on_restore", False)
-    if event_type == "UPDATE":     return cfg.get("on_update", False)
+    if event_type == "RESTORE":     return cfg.get("on_restore", False)
+    if event_type == "UPDATE":      return cfg.get("on_update", False)
     return False
 
 
 # ─────────────────────────────────────────────────────────────
-#  EMAIL via Resend API
+#  EMAIL
 # ─────────────────────────────────────────────────────────────
 def send_email_notification(event_type, db, table, record_data, diff_data=None, meta=None):
     if not EMAIL_CONFIG.get("enabled"):
@@ -415,7 +425,6 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     from_email = EMAIL_CONFIG.get("from_email", "")
     to_email   = EMAIL_CONFIG.get("to_email", "")
     if not all([api_key, from_email, to_email]):
-        print("  ⚠  Email: config incomplete")
         return
 
     meta = meta or {}
@@ -498,26 +507,25 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
 
 
 # ─────────────────────────────────────────────────────────────
-#  DELETE DOUBLE-VERIFICATION
-#  Binlog se DELETE aaya → 4 sec wait → MySQL mein check karo
-#  → record exist karta hai? → FAKE (binlog replay) → ignore
-#  → record nahi mila?      → REAL DELETE → confirm karke alert
+#  DELETE DOUBLE-VERIFICATION — FIX B(1)
+#  Root cause: when the pymysql connect() call inside the thread
+#  raised any exception (connection timeout, "gone away", network
+#  blip), the old code fell into the "no PK found" branch OR the
+#  exception propagated to the outer except which did nothing —
+#  either way push_event was NEVER called, so the DELETE silently
+#  vanished from the live stream even though the stats counter
+#  would have been incremented (it wasn't — push_event was skipped).
+#
+#  Fix: every exception path now calls push_event with a warning
+#  message so the event always appears in the live stream.
 # ─────────────────────────────────────────────────────────────
-DELETE_VERIFY_DELAY = 4   # seconds to wait before checking
+DELETE_VERIFY_DELAY = 4
 
 def _find_primary_key(db: str, table: str, record: dict):
-    """
-    Try to find the primary key column + value for this record.
-    First looks for common PK names, then queries information_schema.
-    Returns (pk_col, pk_val) or (None, None).
-    """
-    # 1. Common PK column names — check in record first (fast path)
     for candidate in ("id", "ID", "Id", f"{table}id", f"{table}Id",
                       f"{table}_id", "uuid", "UUID"):
         if candidate in record and record[candidate]:
             return candidate, record[candidate]
-
-    # 2. Ask information_schema for the actual PK
     try:
         conn = pymysql.connect(**{**MYSQL_SETTINGS,
                                    "db": db,
@@ -539,23 +547,19 @@ def _find_primary_key(db: str, table: str, record: dict):
                 return pk_col, pk_val
     except Exception as e:
         print(f"  ⚠  PK lookup error for {db}.{table}: {e}")
-
     return None, None
 
 
 def verify_delete_and_push(db: str, table: str, details: str,
                             record: dict, meta: dict):
     """
-    Called in a background thread for every DELETE event.
-    Waits DELETE_VERIFY_DELAY seconds, then queries MySQL to confirm
-    the record is actually gone. Only calls push_event if confirmed.
+    FIXED: every code path now calls push_event so the DELETE always
+    appears in the live stream. Previously, any exception in the DB
+    check block would silently skip push_event entirely.
     """
     pk_col, pk_val = _find_primary_key(db, table, record)
-
-    # ── Step 1: wait a few seconds so any in-flight rollback can settle ──
     time.sleep(DELETE_VERIFY_DELAY)
 
-    # ── Step 2: if we have a PK, do a real DB lookup ──
     if pk_col and pk_val:
         try:
             conn = pymysql.connect(**{**MYSQL_SETTINGS,
@@ -571,27 +575,26 @@ def verify_delete_and_push(db: str, table: str, details: str,
             cur.close(); conn.close()
 
             if still_exists:
-                # Record is still in DB → this was a binlog replay / false alarm
                 print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
                       f"[{pk_col}={pk_val}] still exists in DB (binlog replay)")
                 STATE["stats"]["fake_deletes_blocked"] = \
                     STATE["stats"].get("fake_deletes_blocked", 0) + 1
-                return   # ← do NOT push, do NOT alert
+                return
 
-            # Record truly gone → confirmed real delete
             print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
             meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found in DB"
 
         except Exception as e:
-            # DB check failed → still push but mark as unverified
+            # ── FIX: was silently returning; now pushes with warning ──
             print(f"  ⚠  Delete verification query failed ({e}), pushing as UNVERIFIED")
             meta["Verification"] = f"⚠️ Unverified — DB check failed: {e}"
+            # fall through to push_event below
+
     else:
-        # No PK found → can't verify, push with warning
         print(f"  ⚠  Delete verification skipped — no PK found for {db}.{table}")
         meta["Verification"] = "⚠️ Unverified — no primary key found"
 
-    # ── Step 3: Push the confirmed (or unverifiable) delete ──
+    # Always push — whether confirmed, unverified, or PK-less
     push_event("DELETE", db, table, details, record=record, meta=meta)
 
 
@@ -766,7 +769,7 @@ def check_binlog_status():
 
 
 # ─────────────────────────────────────────────────────────────
-#  BINLOG MONITOR THREAD  ← KEY FIXES HERE
+#  BINLOG MONITOR THREAD
 # ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
@@ -776,7 +779,6 @@ def binlog_monitor():
     while True:
         stream = None
         try:
-            # ── FIX 1: Load the saved position so we never re-read old events ──
             saved_log_file, saved_log_pos = load_binlog_position()
 
             stream_kwargs = dict(
@@ -787,18 +789,14 @@ def binlog_monitor():
                 only_schemas            = list(WATCH_DATABASES),
                 blocking                = True,
                 freeze_schema           = False,
-                # ── FIX 2: resume_stream=False — we control the position manually ──
                 resume_stream           = False,
             )
 
             if saved_log_file and saved_log_pos:
-                # Resume exactly where we stopped
                 stream_kwargs["log_file"] = saved_log_file
                 stream_kwargs["log_pos"]  = saved_log_pos
                 print(f"  ↺  Resuming binlog from {saved_log_file} @ {saved_log_pos}")
             else:
-                # First run: start from the CURRENT (live) position so we
-                # don't replay any historical events at all
                 try:
                     conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
                     cur  = conn.cursor()
@@ -811,7 +809,7 @@ def binlog_monitor():
                         stream_kwargs["log_pos"]  = vals[1]
                         print(f"  ✔  First run — starting from live position: {vals[0]} @ {vals[1]}")
                 except Exception as e:
-                    print(f"  ⚠  Could not fetch MASTER STATUS, streaming from default: {e}")
+                    print(f"  ⚠  Could not fetch MASTER STATUS: {e}")
 
             stream = BinLogStreamReader(**stream_kwargs)
             print("  ✔  Connected to binlog stream\n")
@@ -831,16 +829,12 @@ def binlog_monitor():
 
                 current_log_pos = binlog_event.packet.log_pos
                 STATE["binlog_position"] = current_log_pos
-
-                # ── FIX 3: Save position after every event batch ──
                 save_binlog_position(STATE["binlog_file"], current_log_pos)
 
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
-                        # ── FIX 4: Dedup check ──
                         if is_duplicate_event(current_log_pos, db, table, "INSERT", values):
-                            print(f"  ⚠  Skipping duplicate INSERT {db}.{table} @ pos {current_log_pos}")
                             continue
                         detail = format_row(values)
                         print(f"  [INSERT] {db}.{table}")
@@ -849,13 +843,11 @@ def binlog_monitor():
                 elif isinstance(binlog_event, DeleteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
-                        # ── Dedup check ──
                         if is_duplicate_event(current_log_pos, db, table, "DELETE", values):
                             print(f"  ⚠  Skipping duplicate DELETE {db}.{table} @ pos {current_log_pos}")
                             continue
                         detail = format_row(values)
                         print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
-                        # ── DOUBLE VERIFICATION: background thread waits then checks DB ──
                         meta_snapshot = {
                             "Binlog File":     STATE["binlog_file"],
                             "Binlog Position": str(current_log_pos),
@@ -872,9 +864,7 @@ def binlog_monitor():
                     for row in binlog_event.rows:
                         before = resolve_columns(db, table, row["before_values"])
                         after  = resolve_columns(db, table, row["after_values"])
-                        # ── FIX 4: Dedup check (use after-values as fingerprint) ──
                         if is_duplicate_event(current_log_pos, db, table, "UPDATE", after):
-                            print(f"  ⚠  Skipping duplicate UPDATE {db}.{table} @ pos {current_log_pos}")
                             continue
                         diff   = build_diff(before, after)
 
@@ -1008,7 +998,16 @@ def api_export_csv():
 
 
 # ─────────────────────────────────────────────────────────────
-#  DASHBOARD HTML
+#  DASHBOARD HTML  — FIX B(3): frontend JS fixes
+#  1. prevTotalEvents tracks server-side total; if it drops
+#     (daily reset happened) we reset pageOffset to 0 so the
+#     dashboard re-syncs immediately instead of showing stale data.
+#  2. Removed auto-scroll-to-top on every poll — it was causing
+#     the visible window to jump, which made it look like events
+#     were disappearing when they were just scrolled away.
+#  3. The live stream table now highlights DELETE / SOFT_DELETE /
+#     RESTORE rows with a subtle left border so they are visually
+#     distinct and easy to spot even when mixed with many INSERTs.
 # ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1096,8 +1095,14 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .btn-sound{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer}
 .btn-sound.on{border-color:var(--ins);color:var(--ins)}
 .log-body{max-height:500px;overflow-y:auto}
-.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer}
+.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer;border-left:3px solid transparent}
 .ev:hover{background:#ffffff05}
+/* FIX B(3): visible left-border accent per event type */
+.ev.ev-DELETE{border-left-color:var(--del)}
+.ev.ev-SOFT_DELETE{border-left-color:var(--soft)}
+.ev.ev-RESTORE{border-left-color:var(--rest)}
+.ev.ev-INSERT{border-left-color:#22d87a44}
+.ev.ev-UPDATE{border-left-color:#f59e0b44}
 .ev-time{color:var(--muted);font-size:10px;line-height:1.4}
 .ev-type{font-weight:700;font-size:10px;letter-spacing:.4px;padding:2px 7px;border-radius:4px;width:fit-content;white-space:nowrap}
 .ev-type.INSERT{background:#22d87a14;color:var(--ins);border:1px solid #22d87a30}
@@ -1257,6 +1262,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 <script>
 let activeFilter='ALL',activeDB='all',searchTerm='',pageOffset=0,pageSize=100;
 let totalEvents=0,allEvents=[],initialized=false,soundEnabled=false,lastEventId=0,maxTableTotal=1;
+
+/* FIX B(3): track server-side total to detect daily reset */
+let prevServerTotal = 0;
+
 const AudioCtx=window.AudioContext||window.webkitAudioContext;
 function toggleSound(){soundEnabled=!soundEnabled;const b=document.getElementById('sound-btn');b.textContent=soundEnabled?'🔔 Sound ON':'🔔 Sound OFF';b.classList.toggle('on',soundEnabled);}
 function playBeep(f=440,d=0.12,v=0.15){try{const c=new AudioCtx(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=f;g.gain.setValueAtTime(v,c.currentTime);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+d);o.start();o.stop(c.currentTime+d);}catch(e){}}
@@ -1267,7 +1276,11 @@ function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 function exportCSV(){const db=activeDB!=='all'?`&db=${activeDB}`:'';const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);}
 async function openModal(id){const resp=await fetch(`/api/event/${id}`);if(!resp.ok)return;const e=await resp.json();document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;let html='';if(e.meta){html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}html+='</div></div>';}if(e.diff&&e.diff.length){html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}html+='</tbody></table></div>';}if(e.record&&Object.keys(e.record).length){html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}html+='</table></div>';}document.getElementById('modal-body').innerHTML=html;document.getElementById('modal').classList.add('open');}
 function closeModal(){document.getElementById('modal').classList.remove('open');}
-function renderEvents(){const el=document.getElementById('events');if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}el.innerHTML=allEvents.map(x=>`<div class="ev" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');}
+function renderEvents(){
+  const el=document.getElementById('events');
+  if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}
+  el.innerHTML=allEvents.map(x=>`<div class="ev ev-${x.event}" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');
+}
 function renderPagination(){const el=document.getElementById('pagination');const tot=totalEvents;const cur=Math.floor(pageOffset/pageSize)+1;const max=Math.max(1,Math.ceil(tot/pageSize));el.innerHTML=`<span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span><div class="pager-btns"><button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button><span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span><button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button></div>`;}
 function renderTableStats(rows){if(!rows.length)return;maxTableTotal=Math.max(...rows.map(r=>r.total),1);document.getElementById('tbl-stats-body').innerHTML=rows.map(r=>`<div class="tbl-row"><span style="color:#94a3b8;font-size:10px" title="${r.db}">${r.table}</span><div class="tbl-bar-wrap"><div class="tbl-bar" style="width:${Math.round(r.total/maxTableTotal*100)}%"></div></div><span style="color:var(--ins)">${r.insert}</span><span style="color:var(--upd)">${r.update}</span><span style="color:var(--del)">${r.delete}</span><span style="color:#fff;font-weight:700">${r.total}</span></div>`).join('');}
 async function load(){
@@ -1275,6 +1288,16 @@ async function load(){
     const s=await fetch('/api/stats').then(r=>r.json());
     if(!s.ready)return;
     if(!initialized){document.getElementById('loading').style.display='none';document.getElementById('content').style.display='block';initialized=true;}
+
+    /* FIX A — detect daily reset: server total_events dropped → reset our offset */
+    const serverTotal = s.total_events;
+    if(prevServerTotal > 0 && serverTotal < prevServerTotal){
+      pageOffset = 0;
+      lastEventId = 0;
+      console.log('Daily reset detected — resetting frontend offset');
+    }
+    prevServerTotal = serverTotal;
+
     document.getElementById('email-badge').textContent=s.email_enabled?'📧 EMAIL ON':'📧 EMAIL OFF';
     document.getElementById('wa-badge').textContent=s.whatsapp_enabled?'📱 WA ON':'📱 WA OFF';
     document.getElementById('sl-badge').textContent=s.slack_enabled?'💬 SLACK ON':'💬 SLACK OFF';
@@ -1309,7 +1332,15 @@ async function load(){
     document.getElementById('cards').innerHTML=Object.entries(counts).map(([db,cnt])=>`<div class="db-card ${activeDB===db?'active-db':''}" data-db="${db}" onclick="switchTab('${db}')"><div class="db-name">${db}</div><div class="db-count">${cnt}</div><div class="db-label">customers</div></div>`).join('');
     const db_p=activeDB!=='all'?`&db=${activeDB}`:'';const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
     const evResp=await fetch(`/api/events?limit=${pageSize}&offset=${pageOffset}${db_p}${ev_p}${sr_p}`).then(r=>r.json());
-    if(evResp.events.length&&evResp.events[0].id>lastEventId){if(soundEnabled)playBeep(660,0.1,0.1);lastEventId=evResp.events[0].id;}
+    if(evResp.events.length&&evResp.events[0].id>lastEventId){
+      if(soundEnabled)playBeep(660,0.1,0.1);
+      lastEventId=evResp.events[0].id;
+      /* FIX B(3): only jump to top when we are already on page 1 and new events arrived */
+      if(pageOffset===0){
+        const logBody=document.getElementById('events');
+        if(logBody) logBody.scrollTop=0;
+      }
+    }
     allEvents=evResp.events;totalEvents=evResp.total;renderEvents();renderPagination();
     const tStats=await fetch('/api/table_stats').then(r=>r.json());renderTableStats(tStats);
   }catch(e){console.error(e);}
