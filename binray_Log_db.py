@@ -1023,6 +1023,18 @@ def api_export_csv():
 #     RESTORE rows with a subtle left border so they are visually
 #     distinct and easy to spot even when mixed with many INSERTs.
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  DASHBOARD HTML
+#  FIX A: Modal now uses allEvents[] local data instead of
+#          fetch('/api/event/id') — the fetch was breaking when
+#          served through home_server.py proxy because the path
+#          /api/event/123 was not being rewritten to
+#          /tool/binlog/api/event/123, causing 404 and modal
+#          silently not opening.
+#  FIX B: metric-val font auto-shrinks for large numbers using
+#          font-size:clamp(14px,2.2vw,22px) + overflow:hidden
+#          so numbers never spill outside their card box.
+# ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1061,10 +1073,13 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
-.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s}
+/* FIX B: metric card overflow fixed — numbers never spill out */
+.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:hidden}
 .metric:hover{border-color:var(--acc)}
-.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
-.metric-val{font-size:22px;font-weight:700;font-family:'Syne',sans-serif}
+.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* FIX B: clamp shrinks font when number is large, min 14px max 22px */
+.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;width:100%}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
 .c-em{color:#f59e0b}.c-sl{color:var(--sl)}
@@ -1111,7 +1126,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .log-body{max-height:500px;overflow-y:auto}
 .ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer;border-left:3px solid transparent}
 .ev:hover{background:#ffffff05}
-/* FIX B(3): visible left-border accent per event type */
 .ev.ev-DELETE{border-left-color:var(--del)}
 .ev.ev-SOFT_DELETE{border-left-color:var(--soft)}
 .ev.ev-RESTORE{border-left-color:var(--rest)}
@@ -1137,7 +1151,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;align-items:center;justify-content:center;padding:20px}
+/* FIX A: modal z-index raised to 9999 so it always appears above proxy iframe */
+.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:9999;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
 .modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:700px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative}
 .modal-close{position:absolute;top:14px;right:16px;background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
@@ -1276,9 +1291,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 <script>
 let activeFilter='ALL',activeDB='all',searchTerm='',pageOffset=0,pageSize=100;
 let totalEvents=0,allEvents=[],initialized=false,soundEnabled=false,lastEventId=0,maxTableTotal=1;
-
-/* FIX B(3): track server-side total to detect daily reset */
-let prevServerTotal = 0;
+let prevServerTotal=0;
 
 const AudioCtx=window.AudioContext||window.webkitAudioContext;
 function toggleSound(){soundEnabled=!soundEnabled;const b=document.getElementById('sound-btn');b.textContent=soundEnabled?'🔔 Sound ON':'🔔 Sound OFF';b.classList.toggle('on',soundEnabled);}
@@ -1288,29 +1301,59 @@ function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.fl
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 function exportCSV(){const db=activeDB!=='all'?`&db=${activeDB}`:'';const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);}
-async function openModal(id){const resp=await fetch(`/api/event/${id}`);if(!resp.ok)return;const e=await resp.json();document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;let html='';if(e.meta){html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}html+='</div></div>';}if(e.diff&&e.diff.length){html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}html+='</tbody></table></div>';}if(e.record&&Object.keys(e.record).length){html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}html+='</table></div>';}document.getElementById('modal-body').innerHTML=html;document.getElementById('modal').classList.add('open');}
+
+/* FIX A: openModal now reads from allEvents[] in memory instead of
+   fetching /api/event/id — that fetch was breaking through the proxy
+   because the path was not being rewritten correctly, so modal
+   silently returned 404 and never opened. */
+function openModal(id){
+  const e=allEvents.find(x=>x.id===id);
+  if(!e)return;
+  document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
+  let html='';
+  if(e.meta){
+    html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';
+    for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}
+    html+='</div></div>';
+  }
+  if(e.diff&&e.diff.length){
+    html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';
+    for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}
+    html+='</tbody></table></div>';
+  }
+  if(e.record&&Object.keys(e.record).length){
+    html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';
+    for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}
+    html+='</table></div>';
+  }
+  document.getElementById('modal-body').innerHTML=html;
+  document.getElementById('modal').classList.add('open');
+}
+
 function closeModal(){document.getElementById('modal').classList.remove('open');}
+
 function renderEvents(){
   const el=document.getElementById('events');
   if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}
   el.innerHTML=allEvents.map(x=>`<div class="ev ev-${x.event}" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');
 }
+
 function renderPagination(){const el=document.getElementById('pagination');const tot=totalEvents;const cur=Math.floor(pageOffset/pageSize)+1;const max=Math.max(1,Math.ceil(tot/pageSize));el.innerHTML=`<span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span><div class="pager-btns"><button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button><span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span><button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button></div>`;}
+
 function renderTableStats(rows){if(!rows.length)return;maxTableTotal=Math.max(...rows.map(r=>r.total),1);document.getElementById('tbl-stats-body').innerHTML=rows.map(r=>`<div class="tbl-row"><span style="color:#94a3b8;font-size:10px" title="${r.db}">${r.table}</span><div class="tbl-bar-wrap"><div class="tbl-bar" style="width:${Math.round(r.total/maxTableTotal*100)}%"></div></div><span style="color:var(--ins)">${r.insert}</span><span style="color:var(--upd)">${r.update}</span><span style="color:var(--del)">${r.delete}</span><span style="color:#fff;font-weight:700">${r.total}</span></div>`).join('');}
+
 async function load(){
   try{
     const s=await fetch('/api/stats').then(r=>r.json());
     if(!s.ready)return;
     if(!initialized){document.getElementById('loading').style.display='none';document.getElementById('content').style.display='block';initialized=true;}
 
-    /* FIX A — detect daily reset: server total_events dropped → reset our offset */
-    const serverTotal = s.total_events;
-    if(prevServerTotal > 0 && serverTotal < prevServerTotal){
-      pageOffset = 0;
-      lastEventId = 0;
+    const serverTotal=s.total_events;
+    if(prevServerTotal>0&&serverTotal<prevServerTotal){
+      pageOffset=0;lastEventId=0;
       console.log('Daily reset detected — resetting frontend offset');
     }
-    prevServerTotal = serverTotal;
+    prevServerTotal=serverTotal;
 
     document.getElementById('email-badge').textContent=s.email_enabled?'📧 EMAIL ON':'📧 EMAIL OFF';
     document.getElementById('wa-badge').textContent=s.whatsapp_enabled?'📱 WA ON':'📱 WA OFF';
@@ -1339,30 +1382,40 @@ async function load(){
     document.getElementById('wa-status-text').textContent=s.whatsapp_enabled?'Active — INSERT(customer), DELETE, SOFT DELETE':'Disabled';
     document.getElementById('sl-status-text').textContent=s.slack_enabled?`Active — Channel: ${s.slack_channel||'#db-alerts'}`:'Disabled';
     if(s.last_event)document.getElementById('last-event').textContent='Last event: '+s.last_event;
+
     const counts=await fetch('/api/counts').then(r=>r.json());
     const tabsBar=document.getElementById('tabs-bar');
     const existing=new Set([...tabsBar.querySelectorAll('.tab')].map(t=>t.dataset.db||'all'));
     for(const db of Object.keys(counts)){if(!existing.has(db)){const t=document.createElement('div');t.className='tab';t.dataset.db=db;t.textContent=db.replace('adopt','');t.onclick=()=>switchTab(db);t.id='tab-'+db;tabsBar.appendChild(t);}}
     document.getElementById('cards').innerHTML=Object.entries(counts).map(([db,cnt])=>`<div class="db-card ${activeDB===db?'active-db':''}" data-db="${db}" onclick="switchTab('${db}')"><div class="db-name">${db}</div><div class="db-count">${cnt}</div><div class="db-label">customers</div></div>`).join('');
-    const db_p=activeDB!=='all'?`&db=${activeDB}`:'';const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
+
+    const db_p=activeDB!=='all'?`&db=${activeDB}`:'';
+    const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';
+    const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
     const evResp=await fetch(`/api/events?limit=${pageSize}&offset=${pageOffset}${db_p}${ev_p}${sr_p}`).then(r=>r.json());
+
     if(evResp.events.length&&evResp.events[0].id>lastEventId){
       if(soundEnabled)playBeep(660,0.1,0.1);
       lastEventId=evResp.events[0].id;
-      /* FIX B(3): only jump to top when we are already on page 1 and new events arrived */
       if(pageOffset===0){
         const logBody=document.getElementById('events');
-        if(logBody) logBody.scrollTop=0;
+        if(logBody)logBody.scrollTop=0;
       }
     }
-    allEvents=evResp.events;totalEvents=evResp.total;renderEvents();renderPagination();
-    const tStats=await fetch('/api/table_stats').then(r=>r.json());renderTableStats(tStats);
+    allEvents=evResp.events;
+    totalEvents=evResp.total;
+    renderEvents();
+    renderPagination();
+
+    const tStats=await fetch('/api/table_stats').then(r=>r.json());
+    renderTableStats(tStats);
   }catch(e){console.error(e);}
 }
 setInterval(load,1000);load();
 </script>
 </body>
 </html>"""
+
 
 
 @app.route("/")
