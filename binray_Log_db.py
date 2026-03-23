@@ -776,10 +776,37 @@ def binlog_monitor():
     print("  ADOPT DATABASE MONITOR v2 — BINARY LOG CDC")
     print("="*70)
 
+    # ALWAYS start from current live MySQL position — never resume
+    # from saved /tmp/ file which may be hours/days old on Railway,
+    # causing wrong (old) position numbers and past event replay.
+    try:
+        if os.path.exists(POSITION_FILE):
+            os.remove(POSITION_FILE)
+            print("  🗑  Cleared stale binlog position file — starting fresh")
+    except Exception as e:
+        print(f"  ⚠  Could not clear position file: {e}")
+
     while True:
         stream = None
         try:
-            saved_log_file, saved_log_pos = load_binlog_position()
+            # Always fetch current live position from MySQL fresh
+            live_log_file = None
+            live_log_pos  = None
+            try:
+                conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
+                cur  = conn.cursor()
+                cur.execute("SHOW MASTER STATUS")
+                master = cur.fetchone()
+                cur.close(); conn.close()
+                if master:
+                    vals = list(master.values())
+                    live_log_file = vals[0]
+                    live_log_pos  = int(vals[1])
+                    STATE["binlog_file"]     = live_log_file
+                    STATE["binlog_position"] = live_log_pos
+                    print(f"  ✔  Starting from CURRENT live position: {live_log_file} @ {live_log_pos}")
+            except Exception as e:
+                print(f"  ⚠  Could not fetch MASTER STATUS: {e}")
 
             stream_kwargs = dict(
                 connection_settings     = MYSQL_SETTINGS,
@@ -792,24 +819,11 @@ def binlog_monitor():
                 resume_stream           = False,
             )
 
-            if saved_log_file and saved_log_pos:
-                stream_kwargs["log_file"] = saved_log_file
-                stream_kwargs["log_pos"]  = saved_log_pos
-                print(f"  ↺  Resuming binlog from {saved_log_file} @ {saved_log_pos}")
+            if live_log_file and live_log_pos:
+                stream_kwargs["log_file"] = live_log_file
+                stream_kwargs["log_pos"]  = live_log_pos
             else:
-                try:
-                    conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
-                    cur  = conn.cursor()
-                    cur.execute("SHOW MASTER STATUS")
-                    master = cur.fetchone()
-                    cur.close(); conn.close()
-                    if master:
-                        vals = list(master.values())
-                        stream_kwargs["log_file"] = vals[0]
-                        stream_kwargs["log_pos"]  = vals[1]
-                        print(f"  ✔  First run — starting from live position: {vals[0]} @ {vals[1]}")
-                except Exception as e:
-                    print(f"  ⚠  Could not fetch MASTER STATUS: {e}")
+                print("  ⚠  MASTER STATUS unavailable — streaming from default position")
 
             stream = BinLogStreamReader(**stream_kwargs)
             print("  ✔  Connected to binlog stream\n")
@@ -819,7 +833,7 @@ def binlog_monitor():
                 if isinstance(binlog_event, RotateEvent):
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
-                    save_binlog_position(STATE["binlog_file"], STATE["binlog_position"])
+                    # position kept in memory only — not saved to disk
                     continue
 
                 db    = binlog_event.schema
@@ -829,7 +843,7 @@ def binlog_monitor():
 
                 current_log_pos = binlog_event.packet.log_pos
                 STATE["binlog_position"] = current_log_pos
-                save_binlog_position(STATE["binlog_file"], current_log_pos)
+                # position kept in memory only — not saved to disk
 
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
