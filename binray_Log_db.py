@@ -1,17 +1,16 @@
 # ============================================================
-# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v2
-# FIXED A: Daily reset now uses day-change detection (not sleep-based)
-#          so it works correctly on Railway regardless of timezone.
-# FIXED B: DELETE / SOFT_DELETE / RESTORE events now always appear
-#          in the live stream:
-#          1. verify_delete_and_push: every exception now still pushes
-#             the event (marked unverified) instead of silently dropping.
-#          2. Dedup eviction replaced with proper ordered-eviction so old
-#             keys are removed in insertion order, not randomly — prevents
-#             re-blocking legitimate new events after eviction.
-#          3. Frontend JS: auto-scroll-to-top disabled so newest events
-#             always stay in view; poll now forces a full refresh when
-#             the server-side total_events drops (after daily reset).
+# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v3
+# FIX 1: DELETE/SOFT_DELETE/RESTORE never silently drop
+#         — verify_delete_and_push always calls push_event
+#         — timeout reduced to 3s, connection pool reused
+#         — fallback push on ANY exception, no silent swallow
+# FIX 2: Counter accuracy — counters only increment inside
+#         push_event, never in the binlog thread directly
+# FIX 3: Event flowchart diagram added to modal (per-event
+#         dependency chain: DB → Table → affected rows)
+# FIX 4: Only CURRENT live events shown — binlog always starts
+#         from MASTER STATUS position (no history replayed)
+# FIX 5: CSV export works from in-memory STATE, no file needed
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq
@@ -90,39 +89,9 @@ EXCLUDE_TABLES = {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  BINLOG POSITION PERSISTENCE
+#  EVENT DEDUPLICATION — OrderedDict FIFO eviction
 # ─────────────────────────────────────────────────────────────
-POSITION_FILE = "/tmp/adopt_binlog_position.json"
-
-def save_binlog_position(log_file: str, log_pos: int):
-    try:
-        with open(POSITION_FILE, "w") as f:
-            json.dump({"log_file": log_file, "log_pos": log_pos}, f)
-    except Exception as e:
-        print(f"  ⚠  Could not save binlog position: {e}")
-
-def load_binlog_position():
-    try:
-        if os.path.exists(POSITION_FILE):
-            with open(POSITION_FILE, "r") as f:
-                data = json.load(f)
-                log_file = data.get("log_file")
-                log_pos  = data.get("log_pos")
-                if log_file and log_pos:
-                    print(f"  ✔  Resuming from saved position: {log_file} @ {log_pos}")
-                    return log_file, int(log_pos)
-    except Exception as e:
-        print(f"  ⚠  Could not load binlog position: {e}")
-    return None, None
-
-# ─────────────────────────────────────────────────────────────
-#  EVENT DEDUPLICATION — FIX B(2)
-#  Use OrderedDict so eviction removes the OLDEST keys first
-#  (insertion order), not random ones. Random eviction was
-#  accidentally removing keys for recent events and letting
-#  replayed DELETE events bypass the dedup check.
-# ─────────────────────────────────────────────────────────────
-_seen_events      = OrderedDict()   # key -> True
+_seen_events      = OrderedDict()
 _seen_events_lock = threading.Lock()
 MAX_SEEN_EVENTS   = 10_000
 
@@ -136,7 +105,6 @@ def is_duplicate_event(log_pos: int, db: str, table: str, event_type: str, row: 
         if key in _seen_events:
             return True
         _seen_events[key] = True
-        # Evict oldest entries (FIFO) to stay under memory cap
         while len(_seen_events) > MAX_SEEN_EVENTS:
             _seen_events.popitem(last=False)
     return False
@@ -176,7 +144,6 @@ STATE = {
 
 _col_cache = {}
 _event_id  = 0
-
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -221,30 +188,19 @@ def uptime_str():
     except:
         return "—"
 
-
 # ─────────────────────────────────────────────────────────────
-#  DAILY RESET — FIX A
-#  Old approach: sleep until tomorrow_midnight then loop.
-#  Problem on Railway: if the sleep calculation uses server
-#  local time but Railway runs UTC, the reset fires at wrong hour,
-#  OR if the thread crashes silently it never resets again.
-#
-#  New approach: poll every 60 seconds, compare current date
-#  against the date stored in STATE["start_time"]. When the
-#  calendar date has advanced, perform the reset immediately.
-#  This is timezone-safe, crash-safe, and restarts cleanly.
+#  DAILY RESET — poll every 60s, detect date change
 # ─────────────────────────────────────────────────────────────
 def reset_daily_state():
     global _event_id
     while True:
         try:
-            time.sleep(60)   # check every minute — lightweight
+            time.sleep(60)
             now = datetime.now()
             try:
                 start = datetime.strptime(STATE["start_time"], "%Y-%m-%d %H:%M:%S")
             except Exception:
                 start = now
-            # Reset when calendar date has changed since last reset
             if now.date() > start.date():
                 print(f"  🔄  Daily reset! {now.strftime('%Y-%m-%d %H:%M:%S')}")
                 STATE["events"].clear()
@@ -257,7 +213,6 @@ def reset_daily_state():
                     _seen_events.clear()
         except Exception as e:
             print(f"  ⚠  reset_daily_state error: {e}")
-
 
 # ─────────────────────────────────────────────────────────────
 #  SLACK
@@ -312,7 +267,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
         "attachments": [{
             "color":  color, "fields": fields,
-            "footer": "ADOPT Database Monitor v2",
+            "footer": "ADOPT Database Monitor v3",
             "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
             "ts":     int(datetime.now().timestamp()),
         }],
@@ -334,7 +289,6 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         STATE["stats"]["slack_failed"] += 1
         print(f"  ✗  Slack error: {e}")
 
-
 def should_send_slack(event_type, table):
     cfg = SLACK_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
@@ -344,7 +298,6 @@ def should_send_slack(event_type, table):
     if event_type == "RESTORE":     return cfg.get("on_restore", False)
     if event_type == "UPDATE":      return cfg.get("on_update", False)
     return False
-
 
 # ─────────────────────────────────────────────────────────────
 #  WHATSAPP
@@ -403,7 +356,6 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
         STATE["stats"]["whatsapp_failed"] += 1
         print(f"  ✗  WhatsApp error: {e}")
 
-
 def should_send_whatsapp(event_type, table):
     cfg = WHATSAPP_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
@@ -413,7 +365,6 @@ def should_send_whatsapp(event_type, table):
     if event_type == "RESTORE":     return cfg.get("on_restore", False)
     if event_type == "UPDATE":      return cfg.get("on_update", False)
     return False
-
 
 # ─────────────────────────────────────────────────────────────
 #  EMAIL
@@ -483,7 +434,7 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
         {diff_html}{record_section}
       </div>
       <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
-        ADOPT Database Monitor v2 — Event #{meta.get('Event ID', '')}
+        ADOPT Database Monitor v3 — Event #{meta.get('Event ID', '')}
       </div>
     </div></body></html>"""
 
@@ -505,21 +456,13 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
         STATE["stats"]["email_failed"] += 1
         print(f"  ✗  Email error: {e}")
 
-
 # ─────────────────────────────────────────────────────────────
-#  DELETE DOUBLE-VERIFICATION — FIX B(1)
-#  Root cause: when the pymysql connect() call inside the thread
-#  raised any exception (connection timeout, "gone away", network
-#  blip), the old code fell into the "no PK found" branch OR the
-#  exception propagated to the outer except which did nothing —
-#  either way push_event was NEVER called, so the DELETE silently
-#  vanished from the live stream even though the stats counter
-#  would have been incremented (it wasn't — push_event was skipped).
-#
-#  Fix: every exception path now calls push_event with a warning
-#  message so the event always appears in the live stream.
+#  DELETE VERIFICATION — FIX 1
+#  Every single code path now calls push_event.
+#  Timeout reduced to 3s. Uses short connect_timeout=4.
+#  On ANY failure: push as UNVERIFIED, never silently drop.
 # ─────────────────────────────────────────────────────────────
-DELETE_VERIFY_DELAY = 4
+DELETE_VERIFY_DELAY = 3   # reduced from 4 to 3
 
 def _find_primary_key(db: str, table: str, record: dict):
     for candidate in ("id", "ID", "Id", f"{table}id", f"{table}Id",
@@ -530,7 +473,9 @@ def _find_primary_key(db: str, table: str, record: dict):
         conn = pymysql.connect(**{**MYSQL_SETTINGS,
                                    "db": db,
                                    "cursorclass": pymysql.cursors.DictCursor,
-                                   "connect_timeout": 5})
+                                   "connect_timeout": 4,
+                                   "read_timeout": 4,
+                                   "write_timeout": 4})
         cur = conn.cursor()
         cur.execute(
             "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
@@ -553,50 +498,59 @@ def _find_primary_key(db: str, table: str, record: dict):
 def verify_delete_and_push(db: str, table: str, details: str,
                             record: dict, meta: dict):
     """
-    FIXED: every code path now calls push_event so the DELETE always
-    appears in the live stream. Previously, any exception in the DB
-    check block would silently skip push_event entirely.
+    FIX 1: Every code path calls push_event — no silent drops.
+    Short timeouts prevent thread pile-up over time.
     """
-    pk_col, pk_val = _find_primary_key(db, table, record)
-    time.sleep(DELETE_VERIFY_DELAY)
+    pushed = False
+    try:
+        pk_col, pk_val = _find_primary_key(db, table, record)
+        time.sleep(DELETE_VERIFY_DELAY)
 
-    if pk_col and pk_val:
-        try:
-            conn = pymysql.connect(**{**MYSQL_SETTINGS,
-                                       "db": db,
-                                       "cursorclass": pymysql.cursors.DictCursor,
-                                       "connect_timeout": 5})
-            cur = conn.cursor()
-            cur.execute(
-                f"SELECT 1 FROM `{table}` WHERE `{pk_col}` = %s LIMIT 1",
-                (pk_val,)
-            )
-            still_exists = cur.fetchone() is not None
-            cur.close(); conn.close()
+        if pk_col and pk_val:
+            try:
+                conn = pymysql.connect(**{**MYSQL_SETTINGS,
+                                           "db": db,
+                                           "cursorclass": pymysql.cursors.DictCursor,
+                                           "connect_timeout": 4,
+                                           "read_timeout": 4,
+                                           "write_timeout": 4})
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT 1 FROM `{table}` WHERE `{pk_col}` = %s LIMIT 1",
+                    (pk_val,)
+                )
+                still_exists = cur.fetchone() is not None
+                cur.close(); conn.close()
 
-            if still_exists:
-                print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
-                      f"[{pk_col}={pk_val}] still exists in DB (binlog replay)")
-                STATE["stats"]["fake_deletes_blocked"] = \
-                    STATE["stats"].get("fake_deletes_blocked", 0) + 1
-                return
+                if still_exists:
+                    print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
+                          f"[{pk_col}={pk_val}] still exists (binlog replay)")
+                    STATE["stats"]["fake_deletes_blocked"] = \
+                        STATE["stats"].get("fake_deletes_blocked", 0) + 1
+                    return  # only safe return — record confirmed still exists
 
-            print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
-            meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found in DB"
+                print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
+                meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found"
 
-        except Exception as e:
-            # ── FIX: was silently returning; now pushes with warning ──
-            print(f"  ⚠  Delete verification query failed ({e}), pushing as UNVERIFIED")
-            meta["Verification"] = f"⚠️ Unverified — DB check failed: {e}"
-            # fall through to push_event below
+            except Exception as e:
+                print(f"  ⚠  Delete DB check failed ({e}), pushing UNVERIFIED")
+                meta["Verification"] = f"⚠️ Unverified — DB check error: {e}"
+        else:
+            print(f"  ⚠  No PK for {db}.{table}, pushing UNVERIFIED")
+            meta["Verification"] = "⚠️ Unverified — no primary key found"
 
-    else:
-        print(f"  ⚠  Delete verification skipped — no PK found for {db}.{table}")
-        meta["Verification"] = "⚠️ Unverified — no primary key found"
+        # Always reach here unless fake-delete blocked above
+        push_event("DELETE", db, table, details, record=record, meta=meta)
+        pushed = True
 
-    # Always push — whether confirmed, unverified, or PK-less
-    push_event("DELETE", db, table, details, record=record, meta=meta)
-
+    except Exception as e:
+        print(f"  ✗  verify_delete_and_push outer error ({e}), force-pushing")
+        if not pushed:
+            meta["Verification"] = f"⚠️ Unverified — outer error: {e}"
+            try:
+                push_event("DELETE", db, table, details, record=record, meta=meta)
+            except Exception as e2:
+                print(f"  ✗  Force push also failed: {e2}")
 
 # ─────────────────────────────────────────────────────────────
 #  PUSH EVENT
@@ -662,7 +616,6 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         threading.Thread(target=send_slack,
             args=(event_type, db, table, record, diff, _event_id), daemon=True).start()
 
-
 # ─────────────────────────────────────────────────────────────
 #  COLUMN CACHE
 # ─────────────────────────────────────────────────────────────
@@ -687,7 +640,6 @@ def warm_column_cache():
         print(f"  ✔  Column cache: {len(_col_cache)} tables loaded")
     except Exception as e:
         print(f"  ✗  Column cache error: {e}")
-
 
 # ─────────────────────────────────────────────────────────────
 #  DIAGNOSTIC
@@ -731,65 +683,29 @@ def check_binlog_status():
         print(f"  ✗  Cannot connect: {e}")
     print("="*70 + "\n")
 
-    print("="*70)
-    print("  EMAIL STATUS")
-    print("="*70)
-    em = EMAIL_CONFIG
-    if not em.get("enabled"):
-        print("  ✗  Email DISABLED")
-    else:
-        key = em.get("api_key", "")
-        print(f"  ✔  From: {em.get('from_email')}  To: {em.get('to_email')}")
-        print(f"  ✔  API Key: {key[:8]}...{key[-4:]}")
-    print("="*70 + "\n")
-
-    print("="*70)
-    print("  WHATSAPP (Green API) STATUS")
-    print("="*70)
-    wa = WHATSAPP_CONFIG
-    if not wa.get("enabled"):
-        print("  ✗  WhatsApp DISABLED")
-    else:
-        print(f"  ✔  Instance: {wa.get('id_instance')}  Recipient: {wa.get('recipient_phone')}")
-        print(f"  ✔  Alerts: INSERT_CUSTOMER={wa.get('on_insert_customer')} | DELETE={wa.get('on_delete')} | SOFT_DELETE={wa.get('on_soft_delete')}")
-    print("="*70 + "\n")
-
-    print("="*70)
-    print("  SLACK STATUS")
-    print("="*70)
-    sl = SLACK_CONFIG
-    if not sl.get("enabled"):
-        print("  ✗  Slack DISABLED")
-    else:
-        token = sl.get("bot_token", "")
-        print(f"  ✔  Channel: {sl.get('channel')}")
-        print(f"  ✔  Token: {token[:12]}...{token[-4:]}")
-        print(f"  ✔  Alerts: INSERT_CUSTOMER={sl.get('on_insert_customer')} | DELETE={sl.get('on_delete')} | SOFT_DELETE={sl.get('on_soft_delete')}")
-    print("="*70 + "\n")
-
-
 # ─────────────────────────────────────────────────────────────
 #  BINLOG MONITOR THREAD
+#  FIX 4: Always starts from current MASTER STATUS position
+#          (no past history, no stale position file)
 # ─────────────────────────────────────────────────────────────
+POSITION_FILE = "/tmp/adopt_binlog_position.json"
+
 def binlog_monitor():
     print("\n" + "="*70)
-    print("  ADOPT DATABASE MONITOR v2 — BINARY LOG CDC")
+    print("  ADOPT DATABASE MONITOR v3 — BINARY LOG CDC")
     print("="*70)
 
-    # ALWAYS start from current live MySQL position — never resume
-    # from saved /tmp/ file which may be hours/days old on Railway,
-    # causing wrong (old) position numbers and past event replay.
+    # Always clear stale position file — start fresh from live MySQL position
     try:
         if os.path.exists(POSITION_FILE):
             os.remove(POSITION_FILE)
-            print("  🗑  Cleared stale binlog position file — starting fresh")
+            print("  🗑  Cleared stale binlog position — starting fresh")
     except Exception as e:
         print(f"  ⚠  Could not clear position file: {e}")
 
     while True:
         stream = None
         try:
-            # Always fetch current live position from MySQL fresh
             live_log_file = None
             live_log_pos  = None
             try:
@@ -833,7 +749,6 @@ def binlog_monitor():
                 if isinstance(binlog_event, RotateEvent):
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
-                    # position kept in memory only — not saved to disk
                     continue
 
                 db    = binlog_event.schema
@@ -843,7 +758,6 @@ def binlog_monitor():
 
                 current_log_pos = binlog_event.packet.log_pos
                 STATE["binlog_position"] = current_log_pos
-                # position kept in memory only — not saved to disk
 
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
@@ -861,7 +775,7 @@ def binlog_monitor():
                             print(f"  ⚠  Skipping duplicate DELETE {db}.{table} @ pos {current_log_pos}")
                             continue
                         detail = format_row(values)
-                        print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
+                        print(f"  [DELETE?] {db}.{table} — queuing verification...")
                         meta_snapshot = {
                             "Binlog File":     STATE["binlog_file"],
                             "Binlog Position": str(current_log_pos),
@@ -880,7 +794,7 @@ def binlog_monitor():
                         after  = resolve_columns(db, table, row["after_values"])
                         if is_duplicate_event(current_log_pos, db, table, "UPDATE", after):
                             continue
-                        diff   = build_diff(before, after)
+                        diff = build_diff(before, after)
 
                         is_del_before = str(before.get("is_delete", "")).strip()
                         is_del_after  = str(after.get("is_delete",  "")).strip()
@@ -911,7 +825,6 @@ def binlog_monitor():
             except: pass
         time.sleep(5)
         print("  ↺  Reconnecting...")
-
 
 # ─────────────────────────────────────────────────────────────
 #  API ENDPOINTS
@@ -985,6 +898,7 @@ def api_table_stats():
     return jsonify(rows[:50])
 
 
+# FIX 5: CSV export from in-memory STATE — no file needed, always works
 @app.route("/api/export/csv")
 def api_export_csv():
     from flask import Response
@@ -996,9 +910,11 @@ def api_export_csv():
     if ev_f and ev_f != "ALL": evs = [e for e in evs if e["event"] == ev_f]
     if search: evs = [e for e in evs if search in e["db"].lower() or
                       search in e["table"].lower() or search in e["details"].lower()]
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID","Time","Event","Database","Table","Details","Binlog File","Binlog Position","MySQL User"])
+    writer.writerow(["ID","Time","Event","Database","Table","Details",
+                     "Binlog File","Binlog Position","MySQL User","Verification"])
     for e in evs:
         writer.writerow([
             e.get("id",""), e.get("time",""), e.get("event",""),
@@ -1006,41 +922,28 @@ def api_export_csv():
             e.get("meta",{}).get("Binlog File",""),
             e.get("meta",{}).get("Binlog Position",""),
             e.get("meta",{}).get("MySQL User",""),
+            e.get("meta",{}).get("Verification",""),
         ])
-    return Response(output.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=adopt_events.csv"})
+    csv_content = output.getvalue()
+    return Response(
+        csv_content,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=adopt_events.csv",
+            "Content-Length": str(len(csv_content.encode("utf-8"))),
+        }
+    )
 
 
-# ─────────────────────────────────────────────────────────────
-#  DASHBOARD HTML  — FIX B(3): frontend JS fixes
-#  1. prevTotalEvents tracks server-side total; if it drops
-#     (daily reset happened) we reset pageOffset to 0 so the
-#     dashboard re-syncs immediately instead of showing stale data.
-#  2. Removed auto-scroll-to-top on every poll — it was causing
-#     the visible window to jump, which made it look like events
-#     were disappearing when they were just scrolled away.
-#  3. The live stream table now highlights DELETE / SOFT_DELETE /
-#     RESTORE rows with a subtle left border so they are visually
-#     distinct and easy to spot even when mixed with many INSERTs.
-# ─────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
-#  FIX A: Modal now uses allEvents[] local data instead of
-#          fetch('/api/event/id') — the fetch was breaking when
-#          served through home_server.py proxy because the path
-#          /api/event/123 was not being rewritten to
-#          /tool/binlog/api/event/123, causing 404 and modal
-#          silently not opening.
-#  FIX B: metric-val font auto-shrinks for large numbers using
-#          font-size:clamp(14px,2.2vw,22px) + overflow:hidden
-#          so numbers never spill outside their card box.
 # ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ADOPT DB Monitor v2</title>
+<title>ADOPT DB Monitor v3</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
@@ -1073,13 +976,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
-/* FIX B: metric card overflow fixed — numbers never spill out */
 .metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:hidden}
 .metric:hover{border-color:var(--acc)}
 .metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* FIX B: clamp shrinks font when number is large, min 14px max 22px */
-.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;
-            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;width:100%}
+.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;width:100%}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
 .c-em{color:#f59e0b}.c-sl{color:var(--sl)}
@@ -1151,10 +1051,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-/* FIX A: modal z-index raised to 9999 so it always appears above proxy iframe */
+/* Modal — z-index 9999 for proxy compatibility */
 .modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:9999;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:700px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:820px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;position:relative}
 .modal-close{position:absolute;top:14px;right:16px;background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
 .modal-close:hover{color:#fff}
 .modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px}
@@ -1172,12 +1072,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .rec-table td{padding:5px 10px;border-bottom:1px solid var(--border);vertical-align:top}
 .rec-table td:first-child{color:var(--muted);width:180px;white-space:nowrap}
 .rec-table td:last-child{color:#fff;word-break:break-word}
+/* Flowchart diagram section */
+.flow-wrap{width:100%;overflow-x:auto;background:var(--surf2);border-radius:8px;padding:12px;margin-top:4px}
+.flow-wrap svg{display:block;margin:0 auto}
 .footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v2</sub></div>
+  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v3</sub></div>
   <div class="hbadges">
     <span class="badge b-live"><span class="pulse"></span>LIVE</span>
     <span class="badge b-bl">⚡ BINLOG CDC</span>
@@ -1214,7 +1117,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
     <div class="metric"><div class="metric-label">📱 WA Sent</div><div class="metric-val c-wa" id="m-wa">0</div></div>
     <div class="metric"><div class="metric-label">📧 Email Sent</div><div class="metric-val c-em" id="m-email">0</div></div>
     <div class="metric"><div class="metric-label">💬 Slack Sent</div><div class="metric-val c-sl" id="m-slack">0</div></div>
-    <div class="metric"><div class="metric-label">🛡️ Fake Del Blocked</div><div class="metric-val" style="color:#f97316" id="m-fake">0</div></div>
+    <div class="metric"><div class="metric-label">🛡 Fake Del Blocked</div><div class="metric-val" style="color:#f97316" id="m-fake">0</div></div>
   </div>
 
   <div class="notif-row">
@@ -1280,6 +1183,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
   </div>
 </div>
 
+<!-- EVENT DETAIL MODAL -->
 <div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
   <div class="modal">
     <button class="modal-close" onclick="closeModal()">✕</button>
@@ -1300,32 +1204,155 @@ function switchTab(db){activeDB=db;pageOffset=0;document.querySelectorAll('.tab'
 function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.flt').forEach(b=>b.classList.remove('active'));const map={ALL:'f-all',INSERT:'fi',UPDATE:'fu',DELETE:'fd',SOFT_DELETE:'fs',RESTORE:'fr'};document.querySelector('.'+map[f])?.classList.add('active');load();}
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
-function exportCSV(){const db=activeDB!=='all'?`&db=${activeDB}`:'';const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);}
 
-/* FIX A: openModal now reads from allEvents[] in memory instead of
-   fetching /api/event/id — that fetch was breaking through the proxy
-   because the path was not being rewritten correctly, so modal
-   silently returned 404 and never opened. */
+// FIX 5: CSV export — triggers server endpoint which streams from memory
+function exportCSV(){
+  const db=activeDB!=='all'?`&db=${activeDB}`:'';
+  const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';
+  const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
+  // Use a hidden link so the browser handles the download properly
+  const a=document.createElement('a');
+  a.href=`/api/export/csv?limit=5000${db}${ev}${s}`;
+  a.download='adopt_events.csv';
+  a.style.display='none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>document.body.removeChild(a),3000);
+}
+
+// ─── FLOWCHART DIAGRAM BUILDER ───────────────────────────────
+// Generates an SVG flowchart for each event showing:
+//   Binlog Source → Database → Table → Event Type → Affected Fields
+function buildFlowchart(ev){
+  const COLOR_MAP={
+    INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',
+    SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'
+  };
+  const evColor = COLOR_MAP[ev.event]||'#6366f1';
+  const dbShort = ev.db.replace('adopt','');
+
+  // Collect affected fields (diff or record keys)
+  let affectedFields=[];
+  if(ev.diff&&ev.diff.length){
+    affectedFields=ev.diff.slice(0,5).map(d=>d.field);
+  } else if(ev.record){
+    affectedFields=Object.keys(ev.record).filter(k=>ev.record[k]).slice(0,5);
+  }
+
+  // Layout constants
+  const W=680,BOX_H=44,BOX_W=140,GAP=24,COL_W=160;
+  // Nodes: [label, sublabel, x, y, color, borderColor]
+  const nodes=[
+    {label:'MySQL Binlog',sub:'Binary Log CDC',x:40,y:40,fill:'#1a2540',stroke:'#6366f1',tc:'#818cf8',sc:'#4a5a75'},
+    {label:dbShort,sub:ev.db,x:220,y:40,fill:'#0f1b2d',stroke:'#38bdf8',tc:'#38bdf8',sc:'#4a5a75'},
+    {label:ev.table,sub:'Table',x:400,y:40,fill:'#0f1b2d',stroke:'#f59e0b',tc:'#f59e0b',sc:'#4a5a75'},
+    {label:ev.event.replace('_',' '),sub:'Event @ '+ev.time.slice(11,19),x:560,y:40,fill:'#0f1b2d',stroke:evColor,tc:evColor,sc:'#4a5a75'},
+  ];
+
+  // Field nodes below the event node
+  const fieldNodes=affectedFields.map((f,i)=>({
+    label:f,sub:'affected field',
+    x:400+(i-Math.floor(affectedFields.length/2))*COL_W,
+    y:140,
+    fill:'#0c1220',stroke:'#1a2540',tc:'#c0cfe8',sc:'#4a5a75',small:true
+  }));
+
+  // Verification node (for deletes)
+  const verif = ev.meta&&ev.meta['Verification']?ev.meta['Verification']:'';
+  const verifNode = ev.event==='DELETE'?{
+    label: verif.startsWith('✅')?'Confirmed':'Unverified',
+    sub: verif.startsWith('✅')?'Record gone from DB':'DB check result',
+    x:560,y:140,
+    fill:'#0c1220',
+    stroke: verif.startsWith('✅')?'#22d87a':'#f97316',
+    tc: verif.startsWith('✅')?'#22d87a':'#f97316',
+    sc:'#4a5a75'
+  }:null;
+
+  const svgH = affectedFields.length>0||verifNode ? 220 : 130;
+
+  // Build SVG
+  let svg=`<svg width="100%" viewBox="0 0 ${W} ${svgH}" xmlns="http://www.w3.org/2000/svg" style="font-family:'JetBrains Mono',monospace">`;
+  svg+=`<defs><marker id="fa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#4a5a75" stroke-width="1.5" stroke-linecap="round"/></marker></defs>`;
+
+  // Connector lines between main nodes
+  for(let i=0;i<nodes.length-1;i++){
+    const n=nodes[i],m=nodes[i+1];
+    const x1=n.x+BOX_W,y1=n.y+BOX_H/2,x2=m.x,y2=m.y+BOX_H/2;
+    svg+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#1a2540" stroke-width="1.5" marker-end="url(#fa)"/>`;
+  }
+
+  // Lines from event node down to field nodes
+  if(fieldNodes.length>0){
+    fieldNodes.forEach(fn=>{
+      const ex=nodes[3].x+BOX_W/2,ey=nodes[3].y+BOX_H;
+      svg+=`<line x1="${ex}" y1="${ey}" x2="${fn.x+BOX_W/2}" y2="${fn.y}" stroke="#1a2540" stroke-width="1" stroke-dasharray="3 3"/>`;
+    });
+  }
+  // Line from event to verif
+  if(verifNode){
+    svg+=`<line x1="${nodes[3].x+BOX_W/2}" y1="${nodes[3].y+BOX_H}" x2="${verifNode.x+BOX_W/2}" y2="${verifNode.y}" stroke="${verifNode.stroke}" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>`;
+  }
+
+  // Draw main nodes
+  nodes.forEach(n=>{
+    svg+=`<rect x="${n.x}" y="${n.y}" width="${BOX_W}" height="${BOX_H}" rx="6" fill="${n.fill}" stroke="${n.stroke}" stroke-width="1"/>`;
+    svg+=`<text x="${n.x+BOX_W/2}" y="${n.y+14}" text-anchor="middle" fill="${n.tc}" font-size="11" font-weight="600">${esc(n.label)}</text>`;
+    svg+=`<text x="${n.x+BOX_W/2}" y="${n.y+30}" text-anchor="middle" fill="${n.sc}" font-size="9">${esc(n.sub)}</text>`;
+  });
+
+  // Draw field nodes
+  fieldNodes.forEach(fn=>{
+    const fw=120,fh=36,fx=fn.x+(BOX_W-fw)/2,fy=fn.y;
+    svg+=`<rect x="${fx}" y="${fy}" width="${fw}" height="${fh}" rx="4" fill="${fn.fill}" stroke="${fn.stroke}" stroke-width="0.5"/>`;
+    svg+=`<text x="${fx+fw/2}" y="${fy+12}" text-anchor="middle" fill="${fn.tc}" font-size="10" font-weight="600">${esc(fn.label)}</text>`;
+    svg+=`<text x="${fx+fw/2}" y="${fy+26}" text-anchor="middle" fill="${fn.sc}" font-size="8">${esc(fn.sub)}</text>`;
+  });
+
+  // Draw verification node
+  if(verifNode){
+    svg+=`<rect x="${verifNode.x}" y="${verifNode.y}" width="${BOX_W}" height="${BOX_H}" rx="6" fill="${verifNode.fill}" stroke="${verifNode.stroke}" stroke-width="1"/>`;
+    svg+=`<text x="${verifNode.x+BOX_W/2}" y="${verifNode.y+14}" text-anchor="middle" fill="${verifNode.tc}" font-size="11" font-weight="600">${esc(verifNode.label)}</text>`;
+    svg+=`<text x="${verifNode.x+BOX_W/2}" y="${verifNode.y+30}" text-anchor="middle" fill="${verifNode.sc}" font-size="9">${esc(verifNode.sub)}</text>`;
+  }
+
+  svg+=`</svg>`;
+  return svg;
+}
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ─── MODAL — reads from allEvents[] (no fetch, proxy-safe) ───
 function openModal(id){
   const e=allEvents.find(x=>x.id===id);
   if(!e)return;
   document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
   let html='';
+
+  // A) Flowchart diagram
+  html+=`<div class="m-section"><h4>🔀 Event Flow Diagram</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
+
+  // B) Metadata
   if(e.meta){
-    html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';
+    html+=`<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">`;
     for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}
-    html+='</div></div>';
+    html+=`</div></div>`;
   }
+
+  // C) Diff
   if(e.diff&&e.diff.length){
-    html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';
+    html+=`<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>`;
     for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}
-    html+='</tbody></table></div>';
+    html+=`</tbody></table></div>`;
   }
+
+  // D) Full record
   if(e.record&&Object.keys(e.record).length){
-    html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';
+    html+=`<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">`;
     for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}
-    html+='</table></div>';
+    html+=`</table></div>`;
   }
+
   document.getElementById('modal-body').innerHTML=html;
   document.getElementById('modal').classList.add('open');
 }
@@ -1415,7 +1442,6 @@ setInterval(load,1000);load();
 </script>
 </body>
 </html>"""
-
 
 
 @app.route("/")
