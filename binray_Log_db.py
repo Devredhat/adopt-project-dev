@@ -1,22 +1,10 @@
 # ============================================================
-# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v3
-# FIX 1: DELETE/SOFT_DELETE/RESTORE never silently drop
-#         — verify_delete_and_push always calls push_event
-#         — timeout reduced to 3s, connection pool reused
-#         — fallback push on ANY exception, no silent swallow
-# FIX 2: Counter accuracy — counters only increment inside
-#         push_event, never in the binlog thread directly
-# FIX 3: Event flowchart diagram added to modal (per-event
-#         dependency chain: DB → Table → affected rows)
-# FIX 4: Only CURRENT live events shown — binlog always starts
-#         from MASTER STATUS position (no history replayed)
-# FIX 5: CSV export works from in-memory STATE, no file needed
-# FIX 6: Number display fixed - no truncation with ellipsis
-# FIX 7: CSV download fixed - proper file download
-# FIX 8: Enhanced flowchart with better information flow
+# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v2
+# FIXED: Binlog position persistence + event deduplication
+#        prevents replayed DELETE events on reconnect
 # ─────────────────────────────────────────────────────────────
 
-from flask import Flask, render_template_string, jsonify, request as freq, Response, send_file
+from flask import Flask, render_template_string, jsonify, request as freq
 import pymysql
 import threading
 import time
@@ -26,7 +14,6 @@ import os
 import json
 import requests
 from datetime import datetime
-from collections import OrderedDict
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
@@ -92,31 +79,79 @@ EXCLUDE_TABLES = {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  EVENT DEDUPLICATION — OrderedDict FIFO eviction
+#  BINLOG POSITION PERSISTENCE
+#  Saves the last processed binlog file+position to disk so
+#  on reconnect we resume exactly where we left off — this
+#  prevents replaying old events (especially old DELETEs).
 # ─────────────────────────────────────────────────────────────
-_seen_events      = OrderedDict()
+POSITION_FILE = "/tmp/adopt_binlog_position.json"
+
+def save_binlog_position(log_file: str, log_pos: int):
+    """Persist the current binlog position to disk."""
+    try:
+        with open(POSITION_FILE, "w") as f:
+            json.dump({"log_file": log_file, "log_pos": log_pos}, f)
+    except Exception as e:
+        print(f"  ⚠  Could not save binlog position: {e}")
+
+def load_binlog_position():
+    """Load the last saved binlog position. Returns (None, None) if not found."""
+    try:
+        if os.path.exists(POSITION_FILE):
+            with open(POSITION_FILE, "r") as f:
+                data = json.load(f)
+                log_file = data.get("log_file")
+                log_pos  = data.get("log_pos")
+                if log_file and log_pos:
+                    print(f"  ✔  Resuming from saved position: {log_file} @ {log_pos}")
+                    return log_file, int(log_pos)
+    except Exception as e:
+        print(f"  ⚠  Could not load binlog position: {e}")
+    return None, None
+
+# ─────────────────────────────────────────────────────────────
+#  EVENT DEDUPLICATION
+#  Tracks a rolling window of recently seen (binlog_pos, db,
+#  table, event_type) tuples so that if the stream is replayed
+#  briefly on reconnect, duplicate events are silently dropped.
+# ─────────────────────────────────────────────────────────────
+_seen_events = set()       # set of (log_pos, db, table, event_type, row_hash)
 _seen_events_lock = threading.Lock()
-MAX_SEEN_EVENTS   = 10_000
+MAX_SEEN_EVENTS = 10_000   # cap memory usage
 
 def is_duplicate_event(log_pos: int, db: str, table: str, event_type: str, row: dict) -> bool:
+    """Return True if this exact event was already processed."""
+    # Build a lightweight fingerprint from the row's key values
     try:
-        row_repr = str(sorted(row.items())[:8])
+        row_repr = str(sorted(row.items())[:8])   # first 8 fields for speed
     except Exception:
         row_repr = ""
     key = (log_pos, db, table, event_type, row_repr)
     with _seen_events_lock:
         if key in _seen_events:
             return True
-        _seen_events[key] = True
-        while len(_seen_events) > MAX_SEEN_EVENTS:
-            _seen_events.popitem(last=False)
+        _seen_events.add(key)
+        # Trim the set if it grows too large
+        if len(_seen_events) > MAX_SEEN_EVENTS:
+            # Remove a random chunk (sets don't support slicing)
+            remove = list(_seen_events)[:MAX_SEEN_EVENTS // 2]
+            for k in remove:
+                _seen_events.discard(k)
     return False
 
 # ─────────────────────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────────────────────
-def _fresh_stats():
-    return {
+STATE = {
+    "events":          [],
+    "ready":           False,
+    "last_event":      None,
+    "start_time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "binlog_file":     "—",
+    "binlog_position": 0,
+    "mysql_user":      MYSQL_SETTINGS["user"],
+    "mysql_host":      MYSQL_SETTINGS["host"],
+    "stats": {
         "total_inserts":        0,
         "total_updates":        0,
         "total_deletes":        0,
@@ -130,23 +165,13 @@ def _fresh_stats():
         "slack_sent":           0,
         "slack_failed":         0,
         "per_table":            {},
-    }
-
-STATE = {
-    "events":          [],
-    "ready":           False,
-    "last_event":      None,
-    "start_time":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "binlog_file":     "—",
-    "binlog_position": 0,
-    "mysql_user":      MYSQL_SETTINGS["user"],
-    "mysql_host":      MYSQL_SETTINGS["host"],
-    "stats":           _fresh_stats(),
+    },
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
 
 _col_cache = {}
 _event_id  = 0
+
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -191,34 +216,39 @@ def uptime_str():
     except:
         return "—"
 
-# ─────────────────────────────────────────────────────────────
-#  DAILY RESET — poll every 60s, detect date change
-# ─────────────────────────────────────────────────────────────
+
+# ── DAILY RESET ──────────────────────────────────────────────
 def reset_daily_state():
-    global _event_id
     while True:
-        try:
-            time.sleep(60)
-            now = datetime.now()
-            try:
-                start = datetime.strptime(STATE["start_time"], "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                start = now
-            if now.date() > start.date():
-                print(f"  🔄  Daily reset! {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                STATE["events"].clear()
-                STATE["last_event"]      = None
-                STATE["start_time"]      = now.strftime("%Y-%m-%d %H:%M:%S")
-                STATE["stats"]           = _fresh_stats()
-                STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
-                _event_id = 0
-                with _seen_events_lock:
-                    _seen_events.clear()
-        except Exception as e:
-            print(f"  ⚠  reset_daily_state error: {e}")
+        from datetime import timedelta
+        now = datetime.now()
+        tomorrow_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        time.sleep((tomorrow_midnight - now).total_seconds())
+        global _event_id
+        STATE["events"].clear()
+        STATE["last_event"] = None
+        STATE["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        STATE["stats"] = {
+            "total_inserts": 0, "total_updates": 0,
+            "total_deletes": 0, "total_soft_deletes": 0,
+            "total_restores": 0, "fake_deletes_blocked": 0,
+            "whatsapp_sent": 0,
+            "whatsapp_failed": 0, "email_sent": 0,
+            "email_failed": 0, "slack_sent": 0,
+            "slack_failed": 0, "per_table": {},
+        }
+        STATE["customer_counts"] = {db: 0 for db in WATCH_DATABASES}
+        _event_id = 0
+        # Also clear dedup cache on daily reset
+        with _seen_events_lock:
+            _seen_events.clear()
+        print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
+
 
 # ─────────────────────────────────────────────────────────────
-#  SLACK
+#  SLACK via Slack Web API
 # ─────────────────────────────────────────────────────────────
 def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
     if not SLACK_CONFIG.get("enabled"):
@@ -226,6 +256,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
     bot_token = SLACK_CONFIG.get("bot_token", "")
     channel   = SLACK_CONFIG.get("channel", "#db-alerts")
     if not bot_token or not channel:
+        print("  ⚠  Slack: config incomplete")
         return
 
     COLOR_MAP = {
@@ -270,7 +301,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
         "attachments": [{
             "color":  color, "fields": fields,
-            "footer": "ADOPT Database Monitor v3",
+            "footer": "ADOPT Database Monitor v2",
             "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
             "ts":     int(datetime.now().timestamp()),
         }],
@@ -292,18 +323,20 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         STATE["stats"]["slack_failed"] += 1
         print(f"  ✗  Slack error: {e}")
 
+
 def should_send_slack(event_type, table):
     cfg = SLACK_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":      return cfg.get("on_delete", True)
+    if event_type == "DELETE":     return cfg.get("on_delete", True)
     if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":     return cfg.get("on_restore", False)
-    if event_type == "UPDATE":      return cfg.get("on_update", False)
+    if event_type == "RESTORE":    return cfg.get("on_restore", False)
+    if event_type == "UPDATE":     return cfg.get("on_update", False)
     return False
 
+
 # ─────────────────────────────────────────────────────────────
-#  WHATSAPP
+#  WHATSAPP via Green API
 # ─────────────────────────────────────────────────────────────
 def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     if not WHATSAPP_CONFIG.get("enabled"):
@@ -313,6 +346,7 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
     api_url     = WHATSAPP_CONFIG.get("api_url", "").rstrip("/")
     recipient   = WHATSAPP_CONFIG.get("recipient_phone", "")
     if not all([id_instance, api_token, api_url, recipient]):
+        print("  ⚠  WhatsApp: Green API config incomplete")
         return
 
     ICON_MAP = {"INSERT": "🎉", "UPDATE": "✏️", "DELETE": "🗑️", "SOFT_DELETE": "🚫", "RESTORE": "♻️"}
@@ -359,18 +393,20 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
         STATE["stats"]["whatsapp_failed"] += 1
         print(f"  ✗  WhatsApp error: {e}")
 
+
 def should_send_whatsapp(event_type, table):
     cfg = WHATSAPP_CONFIG
     if event_type == "INSERT" and table in CUSTOMER_TABLES:
         return cfg.get("on_insert_customer", True)
-    if event_type == "DELETE":      return cfg.get("on_delete", True)
+    if event_type == "DELETE":     return cfg.get("on_delete", True)
     if event_type == "SOFT_DELETE": return cfg.get("on_soft_delete", True)
-    if event_type == "RESTORE":     return cfg.get("on_restore", False)
-    if event_type == "UPDATE":      return cfg.get("on_update", False)
+    if event_type == "RESTORE":    return cfg.get("on_restore", False)
+    if event_type == "UPDATE":     return cfg.get("on_update", False)
     return False
 
+
 # ─────────────────────────────────────────────────────────────
-#  EMAIL
+#  EMAIL via Resend API
 # ─────────────────────────────────────────────────────────────
 def send_email_notification(event_type, db, table, record_data, diff_data=None, meta=None):
     if not EMAIL_CONFIG.get("enabled"):
@@ -379,6 +415,7 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
     from_email = EMAIL_CONFIG.get("from_email", "")
     to_email   = EMAIL_CONFIG.get("to_email", "")
     if not all([api_key, from_email, to_email]):
+        print("  ⚠  Email: config incomplete")
         return
 
     meta = meta or {}
@@ -437,7 +474,7 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
         {diff_html}{record_section}
       </div>
       <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
-        ADOPT Database Monitor v3 — Event #{meta.get('Event ID', '')}
+        ADOPT Database Monitor v2 — Event #{meta.get('Event ID', '')}
       </div>
     </div></body></html>"""
 
@@ -459,26 +496,33 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
         STATE["stats"]["email_failed"] += 1
         print(f"  ✗  Email error: {e}")
 
+
 # ─────────────────────────────────────────────────────────────
-#  DELETE VERIFICATION — FIX 1
-#  Every single code path now calls push_event.
-#  Timeout reduced to 3s. Uses short connect_timeout=4.
-#  On ANY failure: push as UNVERIFIED, never silently drop.
+#  DELETE DOUBLE-VERIFICATION
+#  Binlog se DELETE aaya → 4 sec wait → MySQL mein check karo
+#  → record exist karta hai? → FAKE (binlog replay) → ignore
+#  → record nahi mila?      → REAL DELETE → confirm karke alert
 # ─────────────────────────────────────────────────────────────
-DELETE_VERIFY_DELAY = 3   # reduced from 4 to 3
+DELETE_VERIFY_DELAY = 4   # seconds to wait before checking
 
 def _find_primary_key(db: str, table: str, record: dict):
+    """
+    Try to find the primary key column + value for this record.
+    First looks for common PK names, then queries information_schema.
+    Returns (pk_col, pk_val) or (None, None).
+    """
+    # 1. Common PK column names — check in record first (fast path)
     for candidate in ("id", "ID", "Id", f"{table}id", f"{table}Id",
                       f"{table}_id", "uuid", "UUID"):
         if candidate in record and record[candidate]:
             return candidate, record[candidate]
+
+    # 2. Ask information_schema for the actual PK
     try:
         conn = pymysql.connect(**{**MYSQL_SETTINGS,
                                    "db": db,
                                    "cursorclass": pymysql.cursors.DictCursor,
-                                   "connect_timeout": 4,
-                                   "read_timeout": 4,
-                                   "write_timeout": 4})
+                                   "connect_timeout": 5})
         cur = conn.cursor()
         cur.execute(
             "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE "
@@ -495,65 +539,61 @@ def _find_primary_key(db: str, table: str, record: dict):
                 return pk_col, pk_val
     except Exception as e:
         print(f"  ⚠  PK lookup error for {db}.{table}: {e}")
+
     return None, None
 
 
 def verify_delete_and_push(db: str, table: str, details: str,
                             record: dict, meta: dict):
     """
-    FIX 1: Every code path calls push_event — no silent drops.
-    Short timeouts prevent thread pile-up over time.
+    Called in a background thread for every DELETE event.
+    Waits DELETE_VERIFY_DELAY seconds, then queries MySQL to confirm
+    the record is actually gone. Only calls push_event if confirmed.
     """
-    pushed = False
-    try:
-        pk_col, pk_val = _find_primary_key(db, table, record)
-        time.sleep(DELETE_VERIFY_DELAY)
+    pk_col, pk_val = _find_primary_key(db, table, record)
 
-        if pk_col and pk_val:
-            try:
-                conn = pymysql.connect(**{**MYSQL_SETTINGS,
-                                           "db": db,
-                                           "cursorclass": pymysql.cursors.DictCursor,
-                                           "connect_timeout": 4,
-                                           "read_timeout": 4,
-                                           "write_timeout": 4})
-                cur = conn.cursor()
-                cur.execute(
-                    f"SELECT 1 FROM `{table}` WHERE `{pk_col}` = %s LIMIT 1",
-                    (pk_val,)
-                )
-                still_exists = cur.fetchone() is not None
-                cur.close(); conn.close()
+    # ── Step 1: wait a few seconds so any in-flight rollback can settle ──
+    time.sleep(DELETE_VERIFY_DELAY)
 
-                if still_exists:
-                    print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
-                          f"[{pk_col}={pk_val}] still exists (binlog replay)")
-                    STATE["stats"]["fake_deletes_blocked"] = \
-                        STATE["stats"].get("fake_deletes_blocked", 0) + 1
-                    return  # only safe return — record confirmed still exists
+    # ── Step 2: if we have a PK, do a real DB lookup ──
+    if pk_col and pk_val:
+        try:
+            conn = pymysql.connect(**{**MYSQL_SETTINGS,
+                                       "db": db,
+                                       "cursorclass": pymysql.cursors.DictCursor,
+                                       "connect_timeout": 5})
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT 1 FROM `{table}` WHERE `{pk_col}` = %s LIMIT 1",
+                (pk_val,)
+            )
+            still_exists = cur.fetchone() is not None
+            cur.close(); conn.close()
 
-                print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
-                meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found"
+            if still_exists:
+                # Record is still in DB → this was a binlog replay / false alarm
+                print(f"  ✋  FAKE DELETE blocked — {db}.{table} "
+                      f"[{pk_col}={pk_val}] still exists in DB (binlog replay)")
+                STATE["stats"]["fake_deletes_blocked"] = \
+                    STATE["stats"].get("fake_deletes_blocked", 0) + 1
+                return   # ← do NOT push, do NOT alert
 
-            except Exception as e:
-                print(f"  ⚠  Delete DB check failed ({e}), pushing UNVERIFIED")
-                meta["Verification"] = f"⚠️ Unverified — DB check error: {e}"
-        else:
-            print(f"  ⚠  No PK for {db}.{table}, pushing UNVERIFIED")
-            meta["Verification"] = "⚠️ Unverified — no primary key found"
+            # Record truly gone → confirmed real delete
+            print(f"  ✔  CONFIRMED DELETE — {db}.{table} [{pk_col}={pk_val}]")
+            meta["Verification"] = f"✅ Confirmed — {pk_col}={pk_val} not found in DB"
 
-        # Always reach here unless fake-delete blocked above
-        push_event("DELETE", db, table, details, record=record, meta=meta)
-        pushed = True
+        except Exception as e:
+            # DB check failed → still push but mark as unverified
+            print(f"  ⚠  Delete verification query failed ({e}), pushing as UNVERIFIED")
+            meta["Verification"] = f"⚠️ Unverified — DB check failed: {e}"
+    else:
+        # No PK found → can't verify, push with warning
+        print(f"  ⚠  Delete verification skipped — no PK found for {db}.{table}")
+        meta["Verification"] = "⚠️ Unverified — no primary key found"
 
-    except Exception as e:
-        print(f"  ✗  verify_delete_and_push outer error ({e}), force-pushing")
-        if not pushed:
-            meta["Verification"] = f"⚠️ Unverified — outer error: {e}"
-            try:
-                push_event("DELETE", db, table, details, record=record, meta=meta)
-            except Exception as e2:
-                print(f"  ✗  Force push also failed: {e2}")
+    # ── Step 3: Push the confirmed (or unverifiable) delete ──
+    push_event("DELETE", db, table, details, record=record, meta=meta)
+
 
 # ─────────────────────────────────────────────────────────────
 #  PUSH EVENT
@@ -619,6 +659,7 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         threading.Thread(target=send_slack,
             args=(event_type, db, table, record, diff, _event_id), daemon=True).start()
 
+
 # ─────────────────────────────────────────────────────────────
 #  COLUMN CACHE
 # ─────────────────────────────────────────────────────────────
@@ -643,6 +684,7 @@ def warm_column_cache():
         print(f"  ✔  Column cache: {len(_col_cache)} tables loaded")
     except Exception as e:
         print(f"  ✗  Column cache error: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
 #  DIAGNOSTIC
@@ -686,46 +728,56 @@ def check_binlog_status():
         print(f"  ✗  Cannot connect: {e}")
     print("="*70 + "\n")
 
-# ─────────────────────────────────────────────────────────────
-#  BINLOG MONITOR THREAD
-#  FIX 4: Always starts from current MASTER STATUS position
-#          (no past history, no stale position file)
-# ─────────────────────────────────────────────────────────────
-POSITION_FILE = "/tmp/adopt_binlog_position.json"
+    print("="*70)
+    print("  EMAIL STATUS")
+    print("="*70)
+    em = EMAIL_CONFIG
+    if not em.get("enabled"):
+        print("  ✗  Email DISABLED")
+    else:
+        key = em.get("api_key", "")
+        print(f"  ✔  From: {em.get('from_email')}  To: {em.get('to_email')}")
+        print(f"  ✔  API Key: {key[:8]}...{key[-4:]}")
+    print("="*70 + "\n")
 
+    print("="*70)
+    print("  WHATSAPP (Green API) STATUS")
+    print("="*70)
+    wa = WHATSAPP_CONFIG
+    if not wa.get("enabled"):
+        print("  ✗  WhatsApp DISABLED")
+    else:
+        print(f"  ✔  Instance: {wa.get('id_instance')}  Recipient: {wa.get('recipient_phone')}")
+        print(f"  ✔  Alerts: INSERT_CUSTOMER={wa.get('on_insert_customer')} | DELETE={wa.get('on_delete')} | SOFT_DELETE={wa.get('on_soft_delete')}")
+    print("="*70 + "\n")
+
+    print("="*70)
+    print("  SLACK STATUS")
+    print("="*70)
+    sl = SLACK_CONFIG
+    if not sl.get("enabled"):
+        print("  ✗  Slack DISABLED")
+    else:
+        token = sl.get("bot_token", "")
+        print(f"  ✔  Channel: {sl.get('channel')}")
+        print(f"  ✔  Token: {token[:12]}...{token[-4:]}")
+        print(f"  ✔  Alerts: INSERT_CUSTOMER={sl.get('on_insert_customer')} | DELETE={sl.get('on_delete')} | SOFT_DELETE={sl.get('on_soft_delete')}")
+    print("="*70 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────
+#  BINLOG MONITOR THREAD  ← KEY FIXES HERE
+# ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
-    print("  ADOPT DATABASE MONITOR v3 — BINARY LOG CDC")
+    print("  ADOPT DATABASE MONITOR v2 — BINARY LOG CDC")
     print("="*70)
-
-    # Always clear stale position file — start fresh from live MySQL position
-    try:
-        if os.path.exists(POSITION_FILE):
-            os.remove(POSITION_FILE)
-            print("  🗑  Cleared stale binlog position — starting fresh")
-    except Exception as e:
-        print(f"  ⚠  Could not clear position file: {e}")
 
     while True:
         stream = None
         try:
-            live_log_file = None
-            live_log_pos  = None
-            try:
-                conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
-                cur  = conn.cursor()
-                cur.execute("SHOW MASTER STATUS")
-                master = cur.fetchone()
-                cur.close(); conn.close()
-                if master:
-                    vals = list(master.values())
-                    live_log_file = vals[0]
-                    live_log_pos  = int(vals[1])
-                    STATE["binlog_file"]     = live_log_file
-                    STATE["binlog_position"] = live_log_pos
-                    print(f"  ✔  Starting from CURRENT live position: {live_log_file} @ {live_log_pos}")
-            except Exception as e:
-                print(f"  ⚠  Could not fetch MASTER STATUS: {e}")
+            # ── FIX 1: Load the saved position so we never re-read old events ──
+            saved_log_file, saved_log_pos = load_binlog_position()
 
             stream_kwargs = dict(
                 connection_settings     = MYSQL_SETTINGS,
@@ -735,14 +787,31 @@ def binlog_monitor():
                 only_schemas            = list(WATCH_DATABASES),
                 blocking                = True,
                 freeze_schema           = False,
+                # ── FIX 2: resume_stream=False — we control the position manually ──
                 resume_stream           = False,
             )
 
-            if live_log_file and live_log_pos:
-                stream_kwargs["log_file"] = live_log_file
-                stream_kwargs["log_pos"]  = live_log_pos
+            if saved_log_file and saved_log_pos:
+                # Resume exactly where we stopped
+                stream_kwargs["log_file"] = saved_log_file
+                stream_kwargs["log_pos"]  = saved_log_pos
+                print(f"  ↺  Resuming binlog from {saved_log_file} @ {saved_log_pos}")
             else:
-                print("  ⚠  MASTER STATUS unavailable — streaming from default position")
+                # First run: start from the CURRENT (live) position so we
+                # don't replay any historical events at all
+                try:
+                    conn = pymysql.connect(**{**MYSQL_SETTINGS, "cursorclass": pymysql.cursors.DictCursor})
+                    cur  = conn.cursor()
+                    cur.execute("SHOW MASTER STATUS")
+                    master = cur.fetchone()
+                    cur.close(); conn.close()
+                    if master:
+                        vals = list(master.values())
+                        stream_kwargs["log_file"] = vals[0]
+                        stream_kwargs["log_pos"]  = vals[1]
+                        print(f"  ✔  First run — starting from live position: {vals[0]} @ {vals[1]}")
+                except Exception as e:
+                    print(f"  ⚠  Could not fetch MASTER STATUS, streaming from default: {e}")
 
             stream = BinLogStreamReader(**stream_kwargs)
             print("  ✔  Connected to binlog stream\n")
@@ -752,6 +821,7 @@ def binlog_monitor():
                 if isinstance(binlog_event, RotateEvent):
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
+                    save_binlog_position(STATE["binlog_file"], STATE["binlog_position"])
                     continue
 
                 db    = binlog_event.schema
@@ -762,10 +832,15 @@ def binlog_monitor():
                 current_log_pos = binlog_event.packet.log_pos
                 STATE["binlog_position"] = current_log_pos
 
+                # ── FIX 3: Save position after every event batch ──
+                save_binlog_position(STATE["binlog_file"], current_log_pos)
+
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
+                        # ── FIX 4: Dedup check ──
                         if is_duplicate_event(current_log_pos, db, table, "INSERT", values):
+                            print(f"  ⚠  Skipping duplicate INSERT {db}.{table} @ pos {current_log_pos}")
                             continue
                         detail = format_row(values)
                         print(f"  [INSERT] {db}.{table}")
@@ -774,11 +849,13 @@ def binlog_monitor():
                 elif isinstance(binlog_event, DeleteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
+                        # ── Dedup check ──
                         if is_duplicate_event(current_log_pos, db, table, "DELETE", values):
                             print(f"  ⚠  Skipping duplicate DELETE {db}.{table} @ pos {current_log_pos}")
                             continue
                         detail = format_row(values)
-                        print(f"  [DELETE?] {db}.{table} — queuing verification...")
+                        print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
+                        # ── DOUBLE VERIFICATION: background thread waits then checks DB ──
                         meta_snapshot = {
                             "Binlog File":     STATE["binlog_file"],
                             "Binlog Position": str(current_log_pos),
@@ -795,9 +872,11 @@ def binlog_monitor():
                     for row in binlog_event.rows:
                         before = resolve_columns(db, table, row["before_values"])
                         after  = resolve_columns(db, table, row["after_values"])
+                        # ── FIX 4: Dedup check (use after-values as fingerprint) ──
                         if is_duplicate_event(current_log_pos, db, table, "UPDATE", after):
+                            print(f"  ⚠  Skipping duplicate UPDATE {db}.{table} @ pos {current_log_pos}")
                             continue
-                        diff = build_diff(before, after)
+                        diff   = build_diff(before, after)
 
                         is_del_before = str(before.get("is_delete", "")).strip()
                         is_del_after  = str(after.get("is_delete",  "")).strip()
@@ -828,6 +907,7 @@ def binlog_monitor():
             except: pass
         time.sleep(5)
         print("  ↺  Reconnecting...")
+
 
 # ─────────────────────────────────────────────────────────────
 #  API ENDPOINTS
@@ -901,9 +981,9 @@ def api_table_stats():
     return jsonify(rows[:50])
 
 
-# FIX 5 & 7: CSV export from in-memory STATE with proper download headers
 @app.route("/api/export/csv")
 def api_export_csv():
+    from flask import Response
     db_f   = freq.args.get("db",    "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
     search = freq.args.get("search","").strip().lower()
@@ -912,37 +992,19 @@ def api_export_csv():
     if ev_f and ev_f != "ALL": evs = [e for e in evs if e["event"] == ev_f]
     if search: evs = [e for e in evs if search in e["db"].lower() or
                       search in e["table"].lower() or search in e["details"].lower()]
-
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID","Time","Event","Database","Table","Details",
-                     "Binlog File","Binlog Position","MySQL User","Verification","Record Data","Changes"])
+    writer.writerow(["ID","Time","Event","Database","Table","Details","Binlog File","Binlog Position","MySQL User"])
     for e in evs:
-        # Format record data as JSON string for CSV
-        record_str = json.dumps(e.get("record", {})) if e.get("record") else ""
-        diff_str = json.dumps(e.get("diff", [])) if e.get("diff") else ""
         writer.writerow([
             e.get("id",""), e.get("time",""), e.get("event",""),
             e.get("db",""), e.get("table",""), e.get("details",""),
             e.get("meta",{}).get("Binlog File",""),
             e.get("meta",{}).get("Binlog Position",""),
             e.get("meta",{}).get("MySQL User",""),
-            e.get("meta",{}).get("Verification",""),
-            record_str,
-            diff_str,
         ])
-    
-    csv_content = output.getvalue()
-    # Create response with proper headers for file download
-    response = Response(
-        csv_content,
-        mimetype="text/csv",
-        headers={
-            "Content-Disposition": "attachment; filename=adopt_events.csv",
-            "Content-Type": "text/csv",
-        }
-    )
-    return response
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=adopt_events.csv"})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -953,7 +1015,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ADOPT DB Monitor v3</title>
+<title>ADOPT DB Monitor v2</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
@@ -964,12 +1026,12 @@ body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospa
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:10px}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
 .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:#fff}
 .logo span{color:var(--acc)}
 .logo sub{font-size:10px;color:var(--muted);font-weight:400;margin-left:4px}
 .hbadges{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.badge{padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap}
+.badge{padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700}
 .b-live{background:#22d87a18;color:#22d87a;border:1px solid #22d87a44}
 .b-bl{background:#6366f118;color:#818cf8;border:1px solid #6366f144}
 .b-em{background:#f59e0b18;color:#f59e0b;border:1px solid #f59e0b44}
@@ -986,10 +1048,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
-.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:visible}
+.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s}
 .metric:hover{border-color:var(--acc)}
-.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:normal;word-break:break-word}
-.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;white-space:normal;word-break:break-word;overflow:visible;display:block;width:100%;line-height:1.3}
+.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
+.metric-val{font-size:22px;font-weight:700;font-family:'Syne',sans-serif}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
 .c-em{color:#f59e0b}.c-sl{color:var(--sl)}
@@ -1014,7 +1076,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .db-card{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 14px;transition:border-color .2s;cursor:pointer}
 .db-card:hover{border-color:var(--acc)}.db-card.active-db{border-color:var(--acc);background:var(--surf2)}
 .db-name{font-size:9px;color:var(--muted);margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.db-count{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;color:#fff;word-break:break-word;white-space:normal}
+.db-count{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;color:#fff}
 .db-label{font-size:9px;color:var(--muted);margin-top:2px}
 .log-wrap{margin:0 24px 24px;background:var(--surf);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .log-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
@@ -1034,13 +1096,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .btn-sound{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer}
 .btn-sound.on{border-color:var(--ins);color:var(--ins)}
 .log-body{max-height:500px;overflow-y:auto}
-.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer;border-left:3px solid transparent}
+.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer}
 .ev:hover{background:#ffffff05}
-.ev.ev-DELETE{border-left-color:var(--del)}
-.ev.ev-SOFT_DELETE{border-left-color:var(--soft)}
-.ev.ev-RESTORE{border-left-color:var(--rest)}
-.ev.ev-INSERT{border-left-color:#22d87a44}
-.ev.ev-UPDATE{border-left-color:#f59e0b44}
 .ev-time{color:var(--muted);font-size:10px;line-height:1.4}
 .ev-type{font-weight:700;font-size:10px;letter-spacing:.4px;padding:2px 7px;border-radius:4px;width:fit-content;white-space:nowrap}
 .ev-type.INSERT{background:#22d87a14;color:var(--ins);border:1px solid #22d87a30}
@@ -1061,15 +1118,14 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-/* Modal — improved styling */
-.modal-overlay{display:none;position:fixed;inset:0;background:#000000cc;z-index:9999;align-items:center;justify-content:center;padding:20px}
+.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:900px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;position:relative}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:700px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;position:relative}
 .modal-close{position:absolute;top:14px;right:16px;background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
 .modal-close:hover{color:#fff}
-.modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:10px}
-.m-section{margin-bottom:20px}
-.m-section h4{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid var(--border)}
+.modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px}
+.m-section{margin-bottom:18px}
+.m-section h4{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid var(--border)}
 .m-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .m-item{background:var(--surf2);border-radius:6px;padding:8px 10px}
 .m-item .lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
@@ -1082,18 +1138,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .rec-table td{padding:5px 10px;border-bottom:1px solid var(--border);vertical-align:top}
 .rec-table td:first-child{color:var(--muted);width:180px;white-space:nowrap}
 .rec-table td:last-child{color:#fff;word-break:break-word}
-/* Enhanced Flowchart diagram section */
-.flow-wrap{width:100%;overflow-x:auto;background:var(--surf2);border-radius:8px;padding:16px;margin-top:8px;border:1px solid var(--border)}
-.flow-wrap svg{display:block;margin:0 auto;max-width:100%;height:auto}
-.flow-legend{display:flex;gap:16px;justify-content:center;margin-top:12px;font-size:9px;color:var(--muted);flex-wrap:wrap}
-.flow-legend span{display:inline-flex;align-items:center;gap:4px}
-.flow-legend .color-dot{width:8px;height:8px;border-radius:2px;display:inline-block}
-.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v3</sub></div>
+  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v2</sub></div>
   <div class="hbadges">
     <span class="badge b-live"><span class="pulse"></span>LIVE</span>
     <span class="badge b-bl">⚡ BINLOG CDC</span>
@@ -1130,7 +1180,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
     <div class="metric"><div class="metric-label">📱 WA Sent</div><div class="metric-val c-wa" id="m-wa">0</div></div>
     <div class="metric"><div class="metric-label">📧 Email Sent</div><div class="metric-val c-em" id="m-email">0</div></div>
     <div class="metric"><div class="metric-label">💬 Slack Sent</div><div class="metric-val c-sl" id="m-slack">0</div></div>
-    <div class="metric"><div class="metric-label">🛡 Fake Del Blocked</div><div class="metric-val" style="color:#f97316" id="m-fake">0</div></div>
+    <div class="metric"><div class="metric-label">🛡️ Fake Del Blocked</div><div class="metric-val" style="color:#f97316" id="m-fake">0</div></div>
   </div>
 
   <div class="notif-row">
@@ -1196,7 +1246,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
   </div>
 </div>
 
-<!-- EVENT DETAIL MODAL -->
 <div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
   <div class="modal">
     <button class="modal-close" onclick="closeModal()">✕</button>
@@ -1208,8 +1257,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 <script>
 let activeFilter='ALL',activeDB='all',searchTerm='',pageOffset=0,pageSize=100;
 let totalEvents=0,allEvents=[],initialized=false,soundEnabled=false,lastEventId=0,maxTableTotal=1;
-let prevServerTotal=0;
-
 const AudioCtx=window.AudioContext||window.webkitAudioContext;
 function toggleSound(){soundEnabled=!soundEnabled;const b=document.getElementById('sound-btn');b.textContent=soundEnabled?'🔔 Sound ON':'🔔 Sound OFF';b.classList.toggle('on',soundEnabled);}
 function playBeep(f=440,d=0.12,v=0.15){try{const c=new AudioCtx(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=f;g.gain.setValueAtTime(v,c.currentTime);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+d);o.start();o.stop(c.currentTime+d);}catch(e){}}
@@ -1217,261 +1264,17 @@ function switchTab(db){activeDB=db;pageOffset=0;document.querySelectorAll('.tab'
 function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.flt').forEach(b=>b.classList.remove('active'));const map={ALL:'f-all',INSERT:'fi',UPDATE:'fu',DELETE:'fd',SOFT_DELETE:'fs',RESTORE:'fr'};document.querySelector('.'+map[f])?.classList.add('active');load();}
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
-
-// FIX 7: CSV export with proper download handling
-function exportCSV(){
-  const db=activeDB!=='all'?`&db=${activeDB}`:'';
-  const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';
-  const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
-  // Use fetch to get the CSV data and trigger download
-  fetch(`/api/export/csv?limit=5000${db}${ev}${s}`)
-    .then(response => {
-      if (!response.ok) throw new Error('Network response was not ok');
-      return response.blob();
-    })
-    .then(blob => {
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `adopt_events_${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
-    })
-    .catch(error => {
-      console.error('CSV download failed:', error);
-      alert('Failed to download CSV. Please try again.');
-    });
-}
-
-// Enhanced Flowchart Diagram Builder with better information flow
-function buildFlowchart(ev){
-  const COLOR_MAP={
-    INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',
-    SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'
-  };
-  const evColor = COLOR_MAP[ev.event]||'#6366f1';
-  const dbShort = ev.db.replace('adopt','').toUpperCase() || ev.db.slice(0,8);
-  
-  // Collect affected fields with values
-  let affectedFields=[];
-  if(ev.diff && ev.diff.length){
-    affectedFields = ev.diff.slice(0,6).map(d => ({
-      name: d.field,
-      from: d.before ? (d.before.length>20 ? d.before.slice(0,17)+'...' : d.before) : '—',
-      to: d.after ? (d.after.length>20 ? d.after.slice(0,17)+'...' : d.after) : '—'
-    }));
-  } else if(ev.record){
-    affectedFields = Object.entries(ev.record)
-      .filter(([k,v]) => v && v !== 'null' && v !== '')
-      .slice(0,6)
-      .map(([k,v]) => ({
-        name: k,
-        from: null,
-        to: v.length>25 ? v.slice(0,22)+'...' : v
-      }));
-  }
-  
-  // Event description
-  const eventDesc = {
-    'INSERT': 'New record created',
-    'UPDATE': 'Existing record modified',
-    'DELETE': 'Record permanently removed',
-    'SOFT_DELETE': 'Record marked as deleted',
-    'RESTORE': 'Record restored from deletion'
-  }[ev.event] || 'Database event detected';
-  
-  // Timeline
-  const eventTime = ev.time;
-  const binlogPos = ev.meta?.['Binlog Position'] || '—';
-  
-  // Layout constants
-  const W = 780, BOX_H = 48, BOX_W = 150, GAP = 20;
-  const startX = 40;
-  
-  // Build nodes array with positions
-  const nodes = [
-    { label: 'MySQL Binlog', sub: 'Change Data Capture', x: startX, y: 30, fill: '#1a2540', stroke: '#6366f1', tc: '#818cf8', sc: '#4a5a75', icon: '📊' },
-    { label: ev.db, sub: 'Database', x: startX + (BOX_W + GAP), y: 30, fill: '#0f1b2d', stroke: '#38bdf8', tc: '#38bdf8', sc: '#4a5a75', icon: '🗄️' },
-    { label: ev.table, sub: 'Table', x: startX + (BOX_W + GAP)*2, y: 30, fill: '#0f1b2d', stroke: '#f59e0b', tc: '#f59e0b', sc: '#4a5a75', icon: '📋' },
-    { label: ev.event.replace('_',' '), sub: eventDesc, x: startX + (BOX_W + GAP)*3, y: 30, fill: '#0f1b2d', stroke: evColor, tc: evColor, sc: '#4a5a75', icon: '⚡' }
-  ];
-  
-  // Timeline info node
-  const timelineNode = {
-    label: eventTime.split(' ')[1] || eventTime,
-    sub: `Binlog pos: ${binlogPos}`,
-    x: startX + (BOX_W + GAP)*4, y: 30,
-    fill: '#0f1b2d', stroke: '#4a5a75', tc: '#c0cfe8', sc: '#4a5a75', icon: '⏱️'
-  };
-  nodes.push(timelineNode);
-  
-  // Field nodes below the event node
-  const fieldNodes = affectedFields.map((f, i) => ({
-    name: f.name,
-    fromVal: f.from,
-    toVal: f.to,
-    hasChange: f.from !== null,
-    x: startX + (BOX_W + GAP) + (i - (affectedFields.length-1)/2) * 110,
-    y: 120
-  }));
-  
-  // Verification node for delete events
-  const verif = ev.meta && ev.meta['Verification'] ? ev.meta['Verification'] : '';
-  const hasVerification = ev.event === 'DELETE' && verif;
-  
-  const svgH = Math.max(200, 130 + (fieldNodes.length > 0 ? 90 : 0) + (hasVerification ? 60 : 0));
-  
-  let svg = `<svg width="100%" viewBox="0 0 ${W} ${svgH}" xmlns="http://www.w3.org/2000/svg" style="font-family:'JetBrains Mono',monospace">`;
-  svg += `<defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
-      <path d="M2 1L8 5L2 9" fill="none" stroke="#4a5a75" stroke-width="1.2" stroke-linecap="round"/>
-    </marker>
-    <marker id="arrowColor" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
-      <path d="M2 1L8 5L2 9" fill="none" stroke="${evColor}" stroke-width="1.2" stroke-linecap="round"/>
-    </marker>
-  </defs>`;
-  
-  // Draw connector lines between main nodes
-  for(let i = 0; i < nodes.length - 1; i++){
-    const n = nodes[i], m = nodes[i+1];
-    const x1 = n.x + BOX_W, y1 = n.y + BOX_H/2;
-    const x2 = m.x, y2 = m.y + BOX_H/2;
-    const marker = i === nodes.length-2 ? 'url(#arrowColor)' : 'url(#arrow)';
-    svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${i === nodes.length-2 ? evColor : '#1a2540'}" stroke-width="1.5" marker-end="${marker}"/>`;
-  }
-  
-  // Draw main nodes
-  nodes.forEach(n => {
-    svg += `<rect x="${n.x}" y="${n.y}" width="${BOX_W}" height="${BOX_H}" rx="8" fill="${n.fill}" stroke="${n.stroke}" stroke-width="1.5"/>`;
-    svg += `<text x="${n.x + BOX_W/2}" y="${n.y + 16}" text-anchor="middle" fill="${n.tc}" font-size="11" font-weight="600">${n.icon || ''} ${esc(n.label)}</text>`;
-    svg += `<text x="${n.x + BOX_W/2}" y="${n.y + 34}" text-anchor="middle" fill="${n.sc}" font-size="9">${esc(n.sub)}</text>`;
-  });
-  
-  // Draw field nodes if any
-  if(fieldNodes.length > 0){
-    const eventNode = nodes[3];
-    const ex = eventNode.x + BOX_W/2, ey = eventNode.y + BOX_H;
-    svg += `<line x1="${ex}" y1="${ey}" x2="${ex}" y2="${fieldNodes[0].y - 10}" stroke="${evColor}" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arrowColor)"/>`;
-    
-    fieldNodes.forEach((fn, idx) => {
-      const fx = fn.x, fy = fn.y;
-      const fw = 100, fh = fn.hasChange ? 52 : 36;
-      svg += `<rect x="${fx}" y="${fy}" width="${fw}" height="${fh}" rx="4" fill="#0c1220" stroke="#1a2540" stroke-width="0.8"/>`;
-      svg += `<text x="${fx + fw/2}" y="${fy + 14}" text-anchor="middle" fill="#c0cfe8" font-size="9" font-weight="600">${esc(fn.name)}</text>`;
-      
-      if(fn.hasChange){
-        svg += `<text x="${fx + fw/2}" y="${fy + 28}" text-anchor="middle" fill="#f87171" font-size="8">← ${esc(fn.fromVal)}</text>`;
-        svg += `<text x="${fx + fw/2}" y="${fy + 42}" text-anchor="middle" fill="#4ade80" font-size="8">→ ${esc(fn.toVal)}</text>`;
-      } else {
-        svg += `<text x="${fx + fw/2}" y="${fy + 28}" text-anchor="middle" fill="#c0cfe8" font-size="9">${esc(fn.toVal)}</text>`;
-      }
-      
-      // Draw connector line from main line to each field
-      const fxLine = ex, fyLine = ey + (idx + 1) * 12;
-      svg += `<line x1="${ex}" y1="${ey + 8}" x2="${fx + fw/2}" y2="${fy}" stroke="#4a5a75" stroke-width="0.8" stroke-dasharray="2 2"/>`;
-    });
-  }
-  
-  // Add verification node for delete events
-  if(hasVerification){
-    const vx = nodes[3].x + BOX_W/2 - 75, vy = nodes[3].y + BOX_H + 40;
-    const vw = 150, vh = 36;
-    const isConfirmed = verif.includes('✅');
-    svg += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" rx="6" fill="#0c1220" stroke="${isConfirmed ? '#22d87a' : '#f97316'}" stroke-width="1"/>`;
-    svg += `<text x="${vx + vw/2}" y="${vy + 14}" text-anchor="middle" fill="${isConfirmed ? '#22d87a' : '#f97316'}" font-size="9" font-weight="600">${isConfirmed ? '✓ CONFIRMED' : '⚠ UNVERIFIED'}</text>`;
-    svg += `<text x="${vx + vw/2}" y="${vy + 28}" text-anchor="middle" fill="#4a5a75" font-size="8">${esc(verif.length > 40 ? verif.slice(0,37)+'...' : verif)}</text>`;
-    
-    // Connect to event node
-    svg += `<line x1="${nodes[3].x + BOX_W/2}" y1="${nodes[3].y + BOX_H}" x2="${vx + vw/2}" y2="${vy}" stroke="${isConfirmed ? '#22d87a' : '#f97316'}" stroke-width="1" stroke-dasharray="3 2"/>`;
-  }
-  
-  svg += `</svg>`;
-  
-  // Add legend
-  const legend = `<div class="flow-legend">
-    <span><div class="color-dot" style="background:#6366f1"></div> Binlog Source</span>
-    <span><div class="color-dot" style="background:#38bdf8"></div> Database</span>
-    <span><div class="color-dot" style="background:#f59e0b"></div> Table</span>
-    <span><div class="color-dot" style="background:${evColor}"></div> Event Type</span>
-    <span><div class="color-dot" style="background:#4ade80"></div> Changed Fields</span>
-  </div>`;
-  
-  return svg + legend;
-}
-
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-
-// Modal content generation
-function openModal(id){
-  const e=allEvents.find(x=>x.id===id);
-  if(!e)return;
-  document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
-  let html='';
-  
-  // Flowchart diagram
-  html+=`<div class="m-section"><h4>🔀 Event Flow & Data Changes</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
-  
-  // Metadata
-  if(e.meta && Object.keys(e.meta).length){
-    html+=`<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">`;
-    const importantMeta = ['Event ID', 'Binlog File', 'Binlog Position', 'MySQL User', 'Detected At', 'Verification'];
-    importantMeta.forEach(key => {
-      if(e.meta[key]) html+=`<div class="m-item"><div class="lbl">${key}</div><div class="val">${esc(e.meta[key])}</div></div>`;
-    });
-    html+=`</div></div>`;
-  }
-  
-  // Changes/Diff
-  if(e.diff && e.diff.length){
-    html+=`<div class="m-section"><h4>🔄 Field Changes (Before → After)</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>`;
-    for(const d of e.diff){
-      html+=`<tr><td>${esc(d.field)}</td><td class="before">${esc(d.before||'—')}</td><td class="after">${esc(d.after||'—')}</td></tr>`;
-    }
-    html+=`</tbody></table></div>`;
-  }
-  
-  // Full record
-  if(e.record && Object.keys(e.record).length){
-    html+=`<div class="m-section"><h4>📋 Complete Record Snapshot</h4><table class="rec-table">`;
-    for(const [k,v] of Object.entries(e.record)){
-      if(v !== null && v !== undefined && v !== ''){
-        html+=`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`;
-      }
-    }
-    html+=`</table></div>`;
-  }
-  
-  document.getElementById('modal-body').innerHTML=html;
-  document.getElementById('modal').classList.add('open');
-}
-
+function exportCSV(){const db=activeDB!=='all'?`&db=${activeDB}`:'';const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';window.open(`/api/export/csv?limit=5000${db}${ev}${s}`);}
+async function openModal(id){const resp=await fetch(`/api/event/${id}`);if(!resp.ok)return;const e=await resp.json();document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;let html='';if(e.meta){html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}html+='</div></div>';}if(e.diff&&e.diff.length){html+='<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}html+='</tbody></table></div>';}if(e.record&&Object.keys(e.record).length){html+='<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">';for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}html+='</table></div>';}document.getElementById('modal-body').innerHTML=html;document.getElementById('modal').classList.add('open');}
 function closeModal(){document.getElementById('modal').classList.remove('open');}
-
-function renderEvents(){
-  const el=document.getElementById('events');
-  if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}
-  el.innerHTML=allEvents.map(x=>`<div class="ev ev-${x.event}" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${esc(x.details||'').substring(0,80)}${(x.details||'').length>80?'...':''}</span><span class="ev-arrow">›</span></div>`).join('');
-}
-
+function renderEvents(){const el=document.getElementById('events');if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}el.innerHTML=allEvents.map(x=>`<div class="ev" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');}
 function renderPagination(){const el=document.getElementById('pagination');const tot=totalEvents;const cur=Math.floor(pageOffset/pageSize)+1;const max=Math.max(1,Math.ceil(tot/pageSize));el.innerHTML=`<span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span><div class="pager-btns"><button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button><span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span><button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button></div>`;}
-
 function renderTableStats(rows){if(!rows.length)return;maxTableTotal=Math.max(...rows.map(r=>r.total),1);document.getElementById('tbl-stats-body').innerHTML=rows.map(r=>`<div class="tbl-row"><span style="color:#94a3b8;font-size:10px" title="${r.db}">${r.table}</span><div class="tbl-bar-wrap"><div class="tbl-bar" style="width:${Math.round(r.total/maxTableTotal*100)}%"></div></div><span style="color:var(--ins)">${r.insert}</span><span style="color:var(--upd)">${r.update}</span><span style="color:var(--del)">${r.delete}</span><span style="color:#fff;font-weight:700">${r.total}</span></div>`).join('');}
-
 async function load(){
   try{
     const s=await fetch('/api/stats').then(r=>r.json());
     if(!s.ready)return;
     if(!initialized){document.getElementById('loading').style.display='none';document.getElementById('content').style.display='block';initialized=true;}
-
-    const serverTotal=s.total_events;
-    if(prevServerTotal>0&&serverTotal<prevServerTotal){
-      pageOffset=0;lastEventId=0;
-      console.log('Daily reset detected — resetting frontend offset');
-    }
-    prevServerTotal=serverTotal;
-
     document.getElementById('email-badge').textContent=s.email_enabled?'📧 EMAIL ON':'📧 EMAIL OFF';
     document.getElementById('wa-badge').textContent=s.whatsapp_enabled?'📱 WA ON':'📱 WA OFF';
     document.getElementById('sl-badge').textContent=s.slack_enabled?'💬 SLACK ON':'💬 SLACK OFF';
@@ -1499,33 +1302,16 @@ async function load(){
     document.getElementById('wa-status-text').textContent=s.whatsapp_enabled?'Active — INSERT(customer), DELETE, SOFT DELETE':'Disabled';
     document.getElementById('sl-status-text').textContent=s.slack_enabled?`Active — Channel: ${s.slack_channel||'#db-alerts'}`:'Disabled';
     if(s.last_event)document.getElementById('last-event').textContent='Last event: '+s.last_event;
-
     const counts=await fetch('/api/counts').then(r=>r.json());
     const tabsBar=document.getElementById('tabs-bar');
     const existing=new Set([...tabsBar.querySelectorAll('.tab')].map(t=>t.dataset.db||'all'));
     for(const db of Object.keys(counts)){if(!existing.has(db)){const t=document.createElement('div');t.className='tab';t.dataset.db=db;t.textContent=db.replace('adopt','');t.onclick=()=>switchTab(db);t.id='tab-'+db;tabsBar.appendChild(t);}}
     document.getElementById('cards').innerHTML=Object.entries(counts).map(([db,cnt])=>`<div class="db-card ${activeDB===db?'active-db':''}" data-db="${db}" onclick="switchTab('${db}')"><div class="db-name">${db}</div><div class="db-count">${cnt}</div><div class="db-label">customers</div></div>`).join('');
-
-    const db_p=activeDB!=='all'?`&db=${activeDB}`:'';
-    const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';
-    const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
+    const db_p=activeDB!=='all'?`&db=${activeDB}`:'';const ev_p=activeFilter!=='ALL'?`&event=${activeFilter}`:'';const sr_p=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
     const evResp=await fetch(`/api/events?limit=${pageSize}&offset=${pageOffset}${db_p}${ev_p}${sr_p}`).then(r=>r.json());
-
-    if(evResp.events.length&&evResp.events[0].id>lastEventId){
-      if(soundEnabled)playBeep(660,0.1,0.1);
-      lastEventId=evResp.events[0].id;
-      if(pageOffset===0){
-        const logBody=document.getElementById('events');
-        if(logBody)logBody.scrollTop=0;
-      }
-    }
-    allEvents=evResp.events;
-    totalEvents=evResp.total;
-    renderEvents();
-    renderPagination();
-
-    const tStats=await fetch('/api/table_stats').then(r=>r.json());
-    renderTableStats(tStats);
+    if(evResp.events.length&&evResp.events[0].id>lastEventId){if(soundEnabled)playBeep(660,0.1,0.1);lastEventId=evResp.events[0].id;}
+    allEvents=evResp.events;totalEvents=evResp.total;renderEvents();renderPagination();
+    const tStats=await fetch('/api/table_stats').then(r=>r.json());renderTableStats(tStats);
   }catch(e){console.error(e);}
 }
 setInterval(load,1000);load();
