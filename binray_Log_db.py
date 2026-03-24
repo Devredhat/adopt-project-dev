@@ -11,9 +11,12 @@
 # FIX 4: Only CURRENT live events shown — binlog always starts
 #         from MASTER STATUS position (no history replayed)
 # FIX 5: CSV export works from in-memory STATE, no file needed
+# FIX 6: Number display fixed - no truncation with ellipsis
+# FIX 7: CSV download fixed - proper file download
+# FIX 8: Enhanced flowchart with better information flow
 # ─────────────────────────────────────────────────────────────
 
-from flask import Flask, render_template_string, jsonify, request as freq
+from flask import Flask, render_template_string, jsonify, request as freq, Response, send_file
 import pymysql
 import threading
 import time
@@ -898,10 +901,9 @@ def api_table_stats():
     return jsonify(rows[:50])
 
 
-# FIX 5: CSV export from in-memory STATE — no file needed, always works
+# FIX 5 & 7: CSV export from in-memory STATE with proper download headers
 @app.route("/api/export/csv")
 def api_export_csv():
-    from flask import Response
     db_f   = freq.args.get("db",    "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
     search = freq.args.get("search","").strip().lower()
@@ -914,8 +916,11 @@ def api_export_csv():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["ID","Time","Event","Database","Table","Details",
-                     "Binlog File","Binlog Position","MySQL User","Verification"])
+                     "Binlog File","Binlog Position","MySQL User","Verification","Record Data","Changes"])
     for e in evs:
+        # Format record data as JSON string for CSV
+        record_str = json.dumps(e.get("record", {})) if e.get("record") else ""
+        diff_str = json.dumps(e.get("diff", [])) if e.get("diff") else ""
         writer.writerow([
             e.get("id",""), e.get("time",""), e.get("event",""),
             e.get("db",""), e.get("table",""), e.get("details",""),
@@ -923,16 +928,21 @@ def api_export_csv():
             e.get("meta",{}).get("Binlog Position",""),
             e.get("meta",{}).get("MySQL User",""),
             e.get("meta",{}).get("Verification",""),
+            record_str,
+            diff_str,
         ])
+    
     csv_content = output.getvalue()
-    return Response(
+    # Create response with proper headers for file download
+    response = Response(
         csv_content,
         mimetype="text/csv",
         headers={
             "Content-Disposition": "attachment; filename=adopt_events.csv",
-            "Content-Length": str(len(csv_content.encode("utf-8"))),
+            "Content-Type": "text/csv",
         }
     )
+    return response
 
 
 # ─────────────────────────────────────────────────────────────
@@ -954,12 +964,12 @@ body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospa
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:10px}
 .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:#fff}
 .logo span{color:var(--acc)}
 .logo sub{font-size:10px;color:var(--muted);font-weight:400;margin-left:4px}
 .hbadges{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.badge{padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700}
+.badge{padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap}
 .b-live{background:#22d87a18;color:#22d87a;border:1px solid #22d87a44}
 .b-bl{background:#6366f118;color:#818cf8;border:1px solid #6366f144}
 .b-em{background:#f59e0b18;color:#f59e0b;border:1px solid #f59e0b44}
@@ -976,10 +986,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
-.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:hidden}
+.metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:visible}
 .metric:hover{border-color:var(--acc)}
-.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;width:100%}
+.metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:normal;word-break:break-word}
+.metric-val{font-size:clamp(14px,2.2vw,22px);font-weight:700;font-family:'Syne',sans-serif;white-space:normal;word-break:break-word;overflow:visible;display:block;width:100%;line-height:1.3}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
 .c-em{color:#f59e0b}.c-sl{color:var(--sl)}
@@ -1004,7 +1014,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .db-card{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 14px;transition:border-color .2s;cursor:pointer}
 .db-card:hover{border-color:var(--acc)}.db-card.active-db{border-color:var(--acc);background:var(--surf2)}
 .db-name{font-size:9px;color:var(--muted);margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.db-count{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;color:#fff}
+.db-count{font-size:26px;font-weight:700;font-family:'Syne',sans-serif;color:#fff;word-break:break-word;white-space:normal}
 .db-label{font-size:9px;color:var(--muted);margin-top:2px}
 .log-wrap{margin:0 24px 24px;background:var(--surf);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .log-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
@@ -1051,15 +1061,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-/* Modal — z-index 9999 for proxy compatibility */
-.modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:9999;align-items:center;justify-content:center;padding:20px}
+/* Modal — improved styling */
+.modal-overlay{display:none;position:fixed;inset:0;background:#000000cc;z-index:9999;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:820px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;position:relative}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:900px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;position:relative}
 .modal-close{position:absolute;top:14px;right:16px;background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
 .modal-close:hover{color:#fff}
-.modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px}
-.m-section{margin-bottom:18px}
-.m-section h4{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid var(--border)}
+.modal h2{font-family:'Syne',sans-serif;font-size:16px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+.m-section{margin-bottom:20px}
+.m-section h4{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid var(--border)}
 .m-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .m-item{background:var(--surf2);border-radius:6px;padding:8px 10px}
 .m-item .lbl{font-size:9px;color:var(--muted);margin-bottom:3px}
@@ -1072,10 +1082,13 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .rec-table td{padding:5px 10px;border-bottom:1px solid var(--border);vertical-align:top}
 .rec-table td:first-child{color:var(--muted);width:180px;white-space:nowrap}
 .rec-table td:last-child{color:#fff;word-break:break-word}
-/* Flowchart diagram section */
-.flow-wrap{width:100%;overflow-x:auto;background:var(--surf2);border-radius:8px;padding:12px;margin-top:4px}
-.flow-wrap svg{display:block;margin:0 auto}
-.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
+/* Enhanced Flowchart diagram section */
+.flow-wrap{width:100%;overflow-x:auto;background:var(--surf2);border-radius:8px;padding:16px;margin-top:8px;border:1px solid var(--border)}
+.flow-wrap svg{display:block;margin:0 auto;max-width:100%;height:auto}
+.flow-legend{display:flex;gap:16px;justify-content:center;margin-top:12px;font-size:9px;color:var(--muted);flex-wrap:wrap}
+.flow-legend span{display:inline-flex;align-items:center;gap:4px}
+.flow-legend .color-dot{width:8px;height:8px;border-radius:2px;display:inline-block}
+.footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 </style>
 </head>
 <body>
@@ -1205,154 +1218,231 @@ function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.fl
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 
-// FIX 5: CSV export — triggers server endpoint which streams from memory
+// FIX 7: CSV export with proper download handling
 function exportCSV(){
   const db=activeDB!=='all'?`&db=${activeDB}`:'';
   const ev=activeFilter!=='ALL'?`&event=${activeFilter}`:'';
   const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
-  // Use a hidden link so the browser handles the download properly
-  const a=document.createElement('a');
-  a.href=`/api/export/csv?limit=5000${db}${ev}${s}`;
-  a.download='adopt_events.csv';
-  a.style.display='none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(()=>document.body.removeChild(a),3000);
+  // Use fetch to get the CSV data and trigger download
+  fetch(`/api/export/csv?limit=5000${db}${ev}${s}`)
+    .then(response => {
+      if (!response.ok) throw new Error('Network response was not ok');
+      return response.blob();
+    })
+    .then(blob => {
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `adopt_events_${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    })
+    .catch(error => {
+      console.error('CSV download failed:', error);
+      alert('Failed to download CSV. Please try again.');
+    });
 }
 
-// ─── FLOWCHART DIAGRAM BUILDER ───────────────────────────────
-// Generates an SVG flowchart for each event showing:
-//   Binlog Source → Database → Table → Event Type → Affected Fields
+// Enhanced Flowchart Diagram Builder with better information flow
 function buildFlowchart(ev){
   const COLOR_MAP={
     INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',
     SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'
   };
   const evColor = COLOR_MAP[ev.event]||'#6366f1';
-  const dbShort = ev.db.replace('adopt','');
-
-  // Collect affected fields (diff or record keys)
+  const dbShort = ev.db.replace('adopt','').toUpperCase() || ev.db.slice(0,8);
+  
+  // Collect affected fields with values
   let affectedFields=[];
-  if(ev.diff&&ev.diff.length){
-    affectedFields=ev.diff.slice(0,5).map(d=>d.field);
+  if(ev.diff && ev.diff.length){
+    affectedFields = ev.diff.slice(0,6).map(d => ({
+      name: d.field,
+      from: d.before ? (d.before.length>20 ? d.before.slice(0,17)+'...' : d.before) : '—',
+      to: d.after ? (d.after.length>20 ? d.after.slice(0,17)+'...' : d.after) : '—'
+    }));
   } else if(ev.record){
-    affectedFields=Object.keys(ev.record).filter(k=>ev.record[k]).slice(0,5);
+    affectedFields = Object.entries(ev.record)
+      .filter(([k,v]) => v && v !== 'null' && v !== '')
+      .slice(0,6)
+      .map(([k,v]) => ({
+        name: k,
+        from: null,
+        to: v.length>25 ? v.slice(0,22)+'...' : v
+      }));
   }
-
+  
+  // Event description
+  const eventDesc = {
+    'INSERT': 'New record created',
+    'UPDATE': 'Existing record modified',
+    'DELETE': 'Record permanently removed',
+    'SOFT_DELETE': 'Record marked as deleted',
+    'RESTORE': 'Record restored from deletion'
+  }[ev.event] || 'Database event detected';
+  
+  // Timeline
+  const eventTime = ev.time;
+  const binlogPos = ev.meta?.['Binlog Position'] || '—';
+  
   // Layout constants
-  const W=680,BOX_H=44,BOX_W=140,GAP=24,COL_W=160;
-  // Nodes: [label, sublabel, x, y, color, borderColor]
-  const nodes=[
-    {label:'MySQL Binlog',sub:'Binary Log CDC',x:40,y:40,fill:'#1a2540',stroke:'#6366f1',tc:'#818cf8',sc:'#4a5a75'},
-    {label:dbShort,sub:ev.db,x:220,y:40,fill:'#0f1b2d',stroke:'#38bdf8',tc:'#38bdf8',sc:'#4a5a75'},
-    {label:ev.table,sub:'Table',x:400,y:40,fill:'#0f1b2d',stroke:'#f59e0b',tc:'#f59e0b',sc:'#4a5a75'},
-    {label:ev.event.replace('_',' '),sub:'Event @ '+ev.time.slice(11,19),x:560,y:40,fill:'#0f1b2d',stroke:evColor,tc:evColor,sc:'#4a5a75'},
+  const W = 780, BOX_H = 48, BOX_W = 150, GAP = 20;
+  const startX = 40;
+  
+  // Build nodes array with positions
+  const nodes = [
+    { label: 'MySQL Binlog', sub: 'Change Data Capture', x: startX, y: 30, fill: '#1a2540', stroke: '#6366f1', tc: '#818cf8', sc: '#4a5a75', icon: '📊' },
+    { label: ev.db, sub: 'Database', x: startX + (BOX_W + GAP), y: 30, fill: '#0f1b2d', stroke: '#38bdf8', tc: '#38bdf8', sc: '#4a5a75', icon: '🗄️' },
+    { label: ev.table, sub: 'Table', x: startX + (BOX_W + GAP)*2, y: 30, fill: '#0f1b2d', stroke: '#f59e0b', tc: '#f59e0b', sc: '#4a5a75', icon: '📋' },
+    { label: ev.event.replace('_',' '), sub: eventDesc, x: startX + (BOX_W + GAP)*3, y: 30, fill: '#0f1b2d', stroke: evColor, tc: evColor, sc: '#4a5a75', icon: '⚡' }
   ];
-
+  
+  // Timeline info node
+  const timelineNode = {
+    label: eventTime.split(' ')[1] || eventTime,
+    sub: `Binlog pos: ${binlogPos}`,
+    x: startX + (BOX_W + GAP)*4, y: 30,
+    fill: '#0f1b2d', stroke: '#4a5a75', tc: '#c0cfe8', sc: '#4a5a75', icon: '⏱️'
+  };
+  nodes.push(timelineNode);
+  
   // Field nodes below the event node
-  const fieldNodes=affectedFields.map((f,i)=>({
-    label:f,sub:'affected field',
-    x:400+(i-Math.floor(affectedFields.length/2))*COL_W,
-    y:140,
-    fill:'#0c1220',stroke:'#1a2540',tc:'#c0cfe8',sc:'#4a5a75',small:true
+  const fieldNodes = affectedFields.map((f, i) => ({
+    name: f.name,
+    fromVal: f.from,
+    toVal: f.to,
+    hasChange: f.from !== null,
+    x: startX + (BOX_W + GAP) + (i - (affectedFields.length-1)/2) * 110,
+    y: 120
   }));
-
-  // Verification node (for deletes)
-  const verif = ev.meta&&ev.meta['Verification']?ev.meta['Verification']:'';
-  const verifNode = ev.event==='DELETE'?{
-    label: verif.startsWith('✅')?'Confirmed':'Unverified',
-    sub: verif.startsWith('✅')?'Record gone from DB':'DB check result',
-    x:560,y:140,
-    fill:'#0c1220',
-    stroke: verif.startsWith('✅')?'#22d87a':'#f97316',
-    tc: verif.startsWith('✅')?'#22d87a':'#f97316',
-    sc:'#4a5a75'
-  }:null;
-
-  const svgH = affectedFields.length>0||verifNode ? 220 : 130;
-
-  // Build SVG
-  let svg=`<svg width="100%" viewBox="0 0 ${W} ${svgH}" xmlns="http://www.w3.org/2000/svg" style="font-family:'JetBrains Mono',monospace">`;
-  svg+=`<defs><marker id="fa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#4a5a75" stroke-width="1.5" stroke-linecap="round"/></marker></defs>`;
-
-  // Connector lines between main nodes
-  for(let i=0;i<nodes.length-1;i++){
-    const n=nodes[i],m=nodes[i+1];
-    const x1=n.x+BOX_W,y1=n.y+BOX_H/2,x2=m.x,y2=m.y+BOX_H/2;
-    svg+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#1a2540" stroke-width="1.5" marker-end="url(#fa)"/>`;
+  
+  // Verification node for delete events
+  const verif = ev.meta && ev.meta['Verification'] ? ev.meta['Verification'] : '';
+  const hasVerification = ev.event === 'DELETE' && verif;
+  
+  const svgH = Math.max(200, 130 + (fieldNodes.length > 0 ? 90 : 0) + (hasVerification ? 60 : 0));
+  
+  let svg = `<svg width="100%" viewBox="0 0 ${W} ${svgH}" xmlns="http://www.w3.org/2000/svg" style="font-family:'JetBrains Mono',monospace">`;
+  svg += `<defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#4a5a75" stroke-width="1.2" stroke-linecap="round"/>
+    </marker>
+    <marker id="arrowColor" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="${evColor}" stroke-width="1.2" stroke-linecap="round"/>
+    </marker>
+  </defs>`;
+  
+  // Draw connector lines between main nodes
+  for(let i = 0; i < nodes.length - 1; i++){
+    const n = nodes[i], m = nodes[i+1];
+    const x1 = n.x + BOX_W, y1 = n.y + BOX_H/2;
+    const x2 = m.x, y2 = m.y + BOX_H/2;
+    const marker = i === nodes.length-2 ? 'url(#arrowColor)' : 'url(#arrow)';
+    svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${i === nodes.length-2 ? evColor : '#1a2540'}" stroke-width="1.5" marker-end="${marker}"/>`;
   }
-
-  // Lines from event node down to field nodes
-  if(fieldNodes.length>0){
-    fieldNodes.forEach(fn=>{
-      const ex=nodes[3].x+BOX_W/2,ey=nodes[3].y+BOX_H;
-      svg+=`<line x1="${ex}" y1="${ey}" x2="${fn.x+BOX_W/2}" y2="${fn.y}" stroke="#1a2540" stroke-width="1" stroke-dasharray="3 3"/>`;
+  
+  // Draw main nodes
+  nodes.forEach(n => {
+    svg += `<rect x="${n.x}" y="${n.y}" width="${BOX_W}" height="${BOX_H}" rx="8" fill="${n.fill}" stroke="${n.stroke}" stroke-width="1.5"/>`;
+    svg += `<text x="${n.x + BOX_W/2}" y="${n.y + 16}" text-anchor="middle" fill="${n.tc}" font-size="11" font-weight="600">${n.icon || ''} ${esc(n.label)}</text>`;
+    svg += `<text x="${n.x + BOX_W/2}" y="${n.y + 34}" text-anchor="middle" fill="${n.sc}" font-size="9">${esc(n.sub)}</text>`;
+  });
+  
+  // Draw field nodes if any
+  if(fieldNodes.length > 0){
+    const eventNode = nodes[3];
+    const ex = eventNode.x + BOX_W/2, ey = eventNode.y + BOX_H;
+    svg += `<line x1="${ex}" y1="${ey}" x2="${ex}" y2="${fieldNodes[0].y - 10}" stroke="${evColor}" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arrowColor)"/>`;
+    
+    fieldNodes.forEach((fn, idx) => {
+      const fx = fn.x, fy = fn.y;
+      const fw = 100, fh = fn.hasChange ? 52 : 36;
+      svg += `<rect x="${fx}" y="${fy}" width="${fw}" height="${fh}" rx="4" fill="#0c1220" stroke="#1a2540" stroke-width="0.8"/>`;
+      svg += `<text x="${fx + fw/2}" y="${fy + 14}" text-anchor="middle" fill="#c0cfe8" font-size="9" font-weight="600">${esc(fn.name)}</text>`;
+      
+      if(fn.hasChange){
+        svg += `<text x="${fx + fw/2}" y="${fy + 28}" text-anchor="middle" fill="#f87171" font-size="8">← ${esc(fn.fromVal)}</text>`;
+        svg += `<text x="${fx + fw/2}" y="${fy + 42}" text-anchor="middle" fill="#4ade80" font-size="8">→ ${esc(fn.toVal)}</text>`;
+      } else {
+        svg += `<text x="${fx + fw/2}" y="${fy + 28}" text-anchor="middle" fill="#c0cfe8" font-size="9">${esc(fn.toVal)}</text>`;
+      }
+      
+      // Draw connector line from main line to each field
+      const fxLine = ex, fyLine = ey + (idx + 1) * 12;
+      svg += `<line x1="${ex}" y1="${ey + 8}" x2="${fx + fw/2}" y2="${fy}" stroke="#4a5a75" stroke-width="0.8" stroke-dasharray="2 2"/>`;
     });
   }
-  // Line from event to verif
-  if(verifNode){
-    svg+=`<line x1="${nodes[3].x+BOX_W/2}" y1="${nodes[3].y+BOX_H}" x2="${verifNode.x+BOX_W/2}" y2="${verifNode.y}" stroke="${verifNode.stroke}" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>`;
+  
+  // Add verification node for delete events
+  if(hasVerification){
+    const vx = nodes[3].x + BOX_W/2 - 75, vy = nodes[3].y + BOX_H + 40;
+    const vw = 150, vh = 36;
+    const isConfirmed = verif.includes('✅');
+    svg += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" rx="6" fill="#0c1220" stroke="${isConfirmed ? '#22d87a' : '#f97316'}" stroke-width="1"/>`;
+    svg += `<text x="${vx + vw/2}" y="${vy + 14}" text-anchor="middle" fill="${isConfirmed ? '#22d87a' : '#f97316'}" font-size="9" font-weight="600">${isConfirmed ? '✓ CONFIRMED' : '⚠ UNVERIFIED'}</text>`;
+    svg += `<text x="${vx + vw/2}" y="${vy + 28}" text-anchor="middle" fill="#4a5a75" font-size="8">${esc(verif.length > 40 ? verif.slice(0,37)+'...' : verif)}</text>`;
+    
+    // Connect to event node
+    svg += `<line x1="${nodes[3].x + BOX_W/2}" y1="${nodes[3].y + BOX_H}" x2="${vx + vw/2}" y2="${vy}" stroke="${isConfirmed ? '#22d87a' : '#f97316'}" stroke-width="1" stroke-dasharray="3 2"/>`;
   }
-
-  // Draw main nodes
-  nodes.forEach(n=>{
-    svg+=`<rect x="${n.x}" y="${n.y}" width="${BOX_W}" height="${BOX_H}" rx="6" fill="${n.fill}" stroke="${n.stroke}" stroke-width="1"/>`;
-    svg+=`<text x="${n.x+BOX_W/2}" y="${n.y+14}" text-anchor="middle" fill="${n.tc}" font-size="11" font-weight="600">${esc(n.label)}</text>`;
-    svg+=`<text x="${n.x+BOX_W/2}" y="${n.y+30}" text-anchor="middle" fill="${n.sc}" font-size="9">${esc(n.sub)}</text>`;
-  });
-
-  // Draw field nodes
-  fieldNodes.forEach(fn=>{
-    const fw=120,fh=36,fx=fn.x+(BOX_W-fw)/2,fy=fn.y;
-    svg+=`<rect x="${fx}" y="${fy}" width="${fw}" height="${fh}" rx="4" fill="${fn.fill}" stroke="${fn.stroke}" stroke-width="0.5"/>`;
-    svg+=`<text x="${fx+fw/2}" y="${fy+12}" text-anchor="middle" fill="${fn.tc}" font-size="10" font-weight="600">${esc(fn.label)}</text>`;
-    svg+=`<text x="${fx+fw/2}" y="${fy+26}" text-anchor="middle" fill="${fn.sc}" font-size="8">${esc(fn.sub)}</text>`;
-  });
-
-  // Draw verification node
-  if(verifNode){
-    svg+=`<rect x="${verifNode.x}" y="${verifNode.y}" width="${BOX_W}" height="${BOX_H}" rx="6" fill="${verifNode.fill}" stroke="${verifNode.stroke}" stroke-width="1"/>`;
-    svg+=`<text x="${verifNode.x+BOX_W/2}" y="${verifNode.y+14}" text-anchor="middle" fill="${verifNode.tc}" font-size="11" font-weight="600">${esc(verifNode.label)}</text>`;
-    svg+=`<text x="${verifNode.x+BOX_W/2}" y="${verifNode.y+30}" text-anchor="middle" fill="${verifNode.sc}" font-size="9">${esc(verifNode.sub)}</text>`;
-  }
-
-  svg+=`</svg>`;
-  return svg;
+  
+  svg += `</svg>`;
+  
+  // Add legend
+  const legend = `<div class="flow-legend">
+    <span><div class="color-dot" style="background:#6366f1"></div> Binlog Source</span>
+    <span><div class="color-dot" style="background:#38bdf8"></div> Database</span>
+    <span><div class="color-dot" style="background:#f59e0b"></div> Table</span>
+    <span><div class="color-dot" style="background:${evColor}"></div> Event Type</span>
+    <span><div class="color-dot" style="background:#4ade80"></div> Changed Fields</span>
+  </div>`;
+  
+  return svg + legend;
 }
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-// ─── MODAL — reads from allEvents[] (no fetch, proxy-safe) ───
+// Modal content generation
 function openModal(id){
   const e=allEvents.find(x=>x.id===id);
   if(!e)return;
   document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
   let html='';
-
-  // A) Flowchart diagram
-  html+=`<div class="m-section"><h4>🔀 Event Flow Diagram</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
-
-  // B) Metadata
-  if(e.meta){
+  
+  // Flowchart diagram
+  html+=`<div class="m-section"><h4>🔀 Event Flow & Data Changes</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
+  
+  // Metadata
+  if(e.meta && Object.keys(e.meta).length){
     html+=`<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">`;
-    for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}
+    const importantMeta = ['Event ID', 'Binlog File', 'Binlog Position', 'MySQL User', 'Detected At', 'Verification'];
+    importantMeta.forEach(key => {
+      if(e.meta[key]) html+=`<div class="m-item"><div class="lbl">${key}</div><div class="val">${esc(e.meta[key])}</div></div>`;
+    });
     html+=`</div></div>`;
   }
-
-  // C) Diff
-  if(e.diff&&e.diff.length){
-    html+=`<div class="m-section"><h4>🔄 Before → After</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>`;
-    for(const d of e.diff){html+=`<tr><td>${d.field}</td><td class="before">${d.before||'—'}</td><td class="after">${d.after||'—'}</td></tr>`;}
+  
+  // Changes/Diff
+  if(e.diff && e.diff.length){
+    html+=`<div class="m-section"><h4>🔄 Field Changes (Before → After)</h4><table class="diff-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>`;
+    for(const d of e.diff){
+      html+=`<tr><td>${esc(d.field)}</td><td class="before">${esc(d.before||'—')}</td><td class="after">${esc(d.after||'—')}</td></tr>`;
+    }
     html+=`</tbody></table></div>`;
   }
-
-  // D) Full record
-  if(e.record&&Object.keys(e.record).length){
-    html+=`<div class="m-section"><h4>📋 Full Record</h4><table class="rec-table">`;
-    for(const[k,v]of Object.entries(e.record)){if(v!==null&&v!==undefined&&v!=='')html+=`<tr><td>${k}</td><td>${v}</td></tr>`;}
+  
+  // Full record
+  if(e.record && Object.keys(e.record).length){
+    html+=`<div class="m-section"><h4>📋 Complete Record Snapshot</h4><table class="rec-table">`;
+    for(const [k,v] of Object.entries(e.record)){
+      if(v !== null && v !== undefined && v !== ''){
+        html+=`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`;
+      }
+    }
     html+=`</table></div>`;
   }
-
+  
   document.getElementById('modal-body').innerHTML=html;
   document.getElementById('modal').classList.add('open');
 }
@@ -1362,7 +1452,7 @@ function closeModal(){document.getElementById('modal').classList.remove('open');
 function renderEvents(){
   const el=document.getElementById('events');
   if(!allEvents.length){el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';return;}
-  el.innerHTML=allEvents.map(x=>`<div class="ev ev-${x.event}" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');
+  el.innerHTML=allEvents.map(x=>`<div class="ev ev-${x.event}" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${esc(x.details||'').substring(0,80)}${(x.details||'').length>80?'...':''}</span><span class="ev-arrow">›</span></div>`).join('');
 }
 
 function renderPagination(){const el=document.getElementById('pagination');const tot=totalEvents;const cur=Math.floor(pageOffset/pageSize)+1;const max=Math.max(1,Math.ceil(tot/pageSize));el.innerHTML=`<span class="pager-info">Showing ${Math.min(pageOffset+1,tot)}–${Math.min(pageOffset+pageSize,tot)} of ${tot} events</span><div class="pager-btns"><button class="flt" onclick="changePage(-1)" ${pageOffset===0?'disabled style="opacity:.3"':''}>← Prev</button><span style="color:#fff;font-size:10px;padding:4px 8px">Page ${cur}/${max}</span><button class="flt" onclick="changePage(1)" ${pageOffset+pageSize>=tot?'disabled style="opacity:.3"':''}>Next →</button></div>`;}
