@@ -23,8 +23,6 @@ import json
 import hashlib
 import requests
 from datetime import datetime
-from flask import Response
-import requests
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
@@ -951,59 +949,46 @@ def api_table_stats():
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/export/csv", methods=["GET"])
 def api_export_csv():
-    db_f   = freq.args.get("db", "").strip().lower()
+    db_f   = freq.args.get("db",    "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
-    search = freq.args.get("search", "").strip().lower()
+    search = freq.args.get("search","").strip().lower()
 
-    # Get events safely
     with _state_lock:
         evs = list(STATE["events"])
 
-    # Apply filters
     if db_f:
         evs = [e for e in evs if e["db"] == db_f]
-
     if ev_f and ev_f not in ("", "ALL"):
         evs = [e for e in evs if e["event"] == ev_f]
-
     if search:
         evs = [e for e in evs if (
-            search in e.get("db", "").lower() or
-            search in e.get("table", "").lower() or
-            search in e.get("details", "").lower()
+            search in e.get("db","").lower() or
+            search in e.get("table","").lower() or
+            search in e.get("details","").lower()
         )]
 
-    # Create CSV
-    import io, csv
+    # Build the entire CSV into one bytes buffer — this gives us
+    # Content-Length and prevents Render's CDN from sniffing it as HTML.
     buf = io.StringIO()
     writer = csv.writer(buf)
-
-    # Header
-    writer.writerow([
-        "ID", "Time", "Event", "Database", "Table",
-        "Details", "Binlog File", "Binlog Position",
-        "MySQL User", "Verification"
-    ])
-
-    # Data rows
+    writer.writerow(["ID","Time","Event","Database","Table","Details",
+                     "Binlog File","Binlog Position","MySQL User","Verification"])
     for e in evs:
         writer.writerow([
-            e.get("id", ""),
-            e.get("time", ""),
-            e.get("event", ""),
-            e.get("db", ""),
-            e.get("table", ""),
-            e.get("details", ""),
-            e.get("meta", {}).get("Binlog File", ""),
-            e.get("meta", {}).get("Binlog Position", ""),
-            e.get("meta", {}).get("MySQL User", ""),
-            e.get("meta", {}).get("Verification", ""),
+            e.get("id",""),
+            e.get("time",""),
+            e.get("event",""),
+            e.get("db",""),
+            e.get("table",""),
+            e.get("details",""),
+            e.get("meta",{}).get("Binlog File",""),
+            e.get("meta",{}).get("Binlog Position",""),
+            e.get("meta",{}).get("MySQL User",""),
+            e.get("meta",{}).get("Verification",""),
         ])
 
-    # Convert to bytes (Excel-friendly)
-    csv_bytes = buf.getvalue().encode("utf-8-sig")
+    csv_bytes = buf.getvalue().encode("utf-8-sig")   # utf-8-sig = Excel-friendly BOM
 
-    # File name
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
         fname += f"_{ev_f.lower()}"
@@ -1011,19 +996,22 @@ def api_export_csv():
         fname += f"_{db_f}"
     fname += ".csv"
 
-    # Return response
     return Response(
         csv_bytes,
         status=200,
-        mimetype="text/csv",
+        mimetype="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f"attachment; filename={fname}",
-            "Content-Length": str(len(csv_bytes)),
-            "Cache-Control": "no-store"
+            # RFC 5987 encoding prevents proxy from misreading filename
+            "Content-Disposition":    f"attachment; filename=\"{fname}\"; filename*=UTF-8''{fname}",
+            "Content-Length":         str(len(csv_bytes)),
+            "Content-Type":           "text/csv; charset=utf-8",
+            # Tell Render / Cloudflare / any CDN: do NOT cache or transform this response
+            "Cache-Control":          "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma":                 "no-cache",
+            "X-Content-Type-Options": "nosniff",
         }
     )
 
-:
 
 # ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
@@ -1305,45 +1293,25 @@ function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 /* FIX — CSV: fetch as blob, then force-download via object URL.
    This bypasses Render's CDN proxy which was renaming .csv → .csv.htm */
 async function exportCSV(){
-  const params = new URLSearchParams();
-
-  if (activeDB !== 'all') params.append('db', activeDB);
-  if (activeFilter !== 'ALL') params.append('event', activeFilter);
-  if (searchTerm) params.append('search', searchTerm);
-
-  const query = params.toString();
-  const url = query ? `/api/export/csv?${query}` : `/api/export/csv`;
-
+  const db=activeDB!=='all'?`&db=${encodeURIComponent(activeDB)}`:'';
+  const ev=activeFilter!=='ALL'?`&event=${encodeURIComponent(activeFilter)}`:'';
+  const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
+  const url=`/api/export/csv?${db}${ev}${s}`.replace(/^&/,'');
   try{
-    const resp = await fetch(url);
-
-    if(!resp.ok){
-      alert('Export failed: '+resp.status);
-      return;
-    }
-
-    const blob = await resp.blob();
-
-    const fname = (resp.headers.get('Content-Disposition')||'')
-      .match(/filename="?([^";]+)"?/);
-
-    const objUrl = URL.createObjectURL(new Blob([blob],{type:'text/csv;charset=utf-8'}));
-
-    const a = document.createElement('a');
-    a.href = objUrl;
-    a.download = fname ? fname[1] : 'adopt_events.csv';
+    const resp=await fetch(url);
+    if(!resp.ok){alert('Export failed: '+resp.status);return;}
+    const blob=await resp.blob();
+    const fname=(resp.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)"?/);
+    const objUrl=URL.createObjectURL(new Blob([blob],{type:'text/csv;charset=utf-8'}));
+    const a=document.createElement('a');
+    a.href=objUrl;
+    a.download=fname?fname[1]:'adopt_events.csv';
     document.body.appendChild(a);
     a.click();
-
-    setTimeout(()=>{
-      URL.revokeObjectURL(objUrl);
-      document.body.removeChild(a);
-    },2000);
-
-  }catch(err){
-    alert('Export error: '+err);
-  }
+    setTimeout(()=>{URL.revokeObjectURL(objUrl);document.body.removeChild(a);},2000);
+  }catch(err){alert('Export error: '+err);}
 }
+
 /* ── Per-event flowchart — plain English, shows WHAT happened to THIS record ── */
 function buildFlowchart(e){
   const COLOR={INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'};
