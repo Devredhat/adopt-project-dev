@@ -23,6 +23,8 @@ import json
 import hashlib
 import requests
 from datetime import datetime
+from flask import Response
+import requests
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent
@@ -1012,6 +1014,20 @@ def api_export_csv():
         }
     )
 
+@home_app.route("/api/export/csv")
+def proxy_csv():
+    try:
+        resp = requests.get("http://localhost:5000/api/export/csv", stream=True)
+
+        return Response(
+            resp.content,
+            content_type=resp.headers.get('Content-Type'),
+            headers={
+                "Content-Disposition": resp.headers.get("Content-Disposition", "attachment; filename=export.csv")
+            }
+        )
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 # ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
