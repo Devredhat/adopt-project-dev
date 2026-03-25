@@ -1014,20 +1014,8 @@ def api_export_csv():
         }
     )
 
-@app.route("/api/export/csv")
-def proxy_csv():
-    try:
-        resp = requests.get("http://localhost:5000/api/export/csv", stream=True)
-
-        return Response(
-            resp.content,
-            content_type=resp.headers.get('Content-Type'),
-            headers={
-                "Content-Disposition": resp.headers.get("Content-Disposition", "attachment; filename=export.csv")
-            }
-        )
-    except Exception as e:
-        return {"error": str(e)}, 500
+@app.route("/api/export/csv", methods=["GET"])
+def api_export_csv():
 
 # ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
