@@ -1014,7 +1014,7 @@ def api_export_csv():
         }
     )
 
-@home_app.route("/api/export/csv")
+@app.route("/api/export/csv")
 def proxy_csv():
     try:
         resp = requests.get("http://localhost:5000/api/export/csv", stream=True)
