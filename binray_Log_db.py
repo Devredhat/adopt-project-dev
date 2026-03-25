@@ -1299,7 +1299,8 @@ async function exportCSV(){
   if (activeFilter !== 'ALL') params.append('event', activeFilter);
   if (searchTerm) params.append('search', searchTerm);
 
-  const url = `/api/export/csv?${params.toString()}`;
+  const query = params.toString();
+  const url = query ? `/api/export/csv?${query}` : `/api/export/csv`;
 
   try{
     const resp = await fetch(url);
@@ -1331,7 +1332,6 @@ async function exportCSV(){
     alert('Export error: '+err);
   }
 }
-
 /* ── Per-event flowchart — plain English, shows WHAT happened to THIS record ── */
 function buildFlowchart(e){
   const COLOR={INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'};
