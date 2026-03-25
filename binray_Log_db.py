@@ -1293,23 +1293,43 @@ function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 /* FIX — CSV: fetch as blob, then force-download via object URL.
    This bypasses Render's CDN proxy which was renaming .csv → .csv.htm */
 async function exportCSV(){
-  const db=activeDB!=='all'?`&db=${encodeURIComponent(activeDB)}`:'';
-  const ev=activeFilter!=='ALL'?`&event=${encodeURIComponent(activeFilter)}`:'';
-  const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
-  const url=`/api/export/csv?${db}${ev}${s}`.replace(/^&/,'');
+  const params = new URLSearchParams();
+
+  if (activeDB !== 'all') params.append('db', activeDB);
+  if (activeFilter !== 'ALL') params.append('event', activeFilter);
+  if (searchTerm) params.append('search', searchTerm);
+
+  const url = `/api/export/csv?${params.toString()}`;
+
   try{
-    const resp=await fetch(url);
-    if(!resp.ok){alert('Export failed: '+resp.status);return;}
-    const blob=await resp.blob();
-    const fname=(resp.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)"?/);
-    const objUrl=URL.createObjectURL(new Blob([blob],{type:'text/csv;charset=utf-8'}));
-    const a=document.createElement('a');
-    a.href=objUrl;
-    a.download=fname?fname[1]:'adopt_events.csv';
+    const resp = await fetch(url);
+
+    if(!resp.ok){
+      alert('Export failed: '+resp.status);
+      return;
+    }
+
+    const blob = await resp.blob();
+
+    const fname = (resp.headers.get('Content-Disposition')||'')
+      .match(/filename="?([^";]+)"?/);
+
+    const objUrl = URL.createObjectURL(new Blob([blob],{type:'text/csv;charset=utf-8'}));
+
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = fname ? fname[1] : 'adopt_events.csv';
     document.body.appendChild(a);
     a.click();
-    setTimeout(()=>{URL.revokeObjectURL(objUrl);document.body.removeChild(a);},2000);
-  }catch(err){alert('Export error: '+err);}
+
+    setTimeout(()=>{
+      URL.revokeObjectURL(objUrl);
+      document.body.removeChild(a);
+    },2000);
+
+  }catch(err){
+    alert('Export error: '+err);
+  }
 }
 
 /* ── Per-event flowchart — plain English, shows WHAT happened to THIS record ── */
