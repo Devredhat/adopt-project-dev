@@ -951,46 +951,59 @@ def api_table_stats():
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/export/csv", methods=["GET"])
 def api_export_csv():
-    db_f   = freq.args.get("db",    "").strip().lower()
+    db_f   = freq.args.get("db", "").strip().lower()
     ev_f   = freq.args.get("event", "").strip().upper()
-    search = freq.args.get("search","").strip().lower()
+    search = freq.args.get("search", "").strip().lower()
 
+    # Get events safely
     with _state_lock:
         evs = list(STATE["events"])
 
+    # Apply filters
     if db_f:
         evs = [e for e in evs if e["db"] == db_f]
+
     if ev_f and ev_f not in ("", "ALL"):
         evs = [e for e in evs if e["event"] == ev_f]
+
     if search:
         evs = [e for e in evs if (
-            search in e.get("db","").lower() or
-            search in e.get("table","").lower() or
-            search in e.get("details","").lower()
+            search in e.get("db", "").lower() or
+            search in e.get("table", "").lower() or
+            search in e.get("details", "").lower()
         )]
 
-    # Build the entire CSV into one bytes buffer — this gives us
-    # Content-Length and prevents Render's CDN from sniffing it as HTML.
+    # Create CSV
+    import io, csv
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["ID","Time","Event","Database","Table","Details",
-                     "Binlog File","Binlog Position","MySQL User","Verification"])
+
+    # Header
+    writer.writerow([
+        "ID", "Time", "Event", "Database", "Table",
+        "Details", "Binlog File", "Binlog Position",
+        "MySQL User", "Verification"
+    ])
+
+    # Data rows
     for e in evs:
         writer.writerow([
-            e.get("id",""),
-            e.get("time",""),
-            e.get("event",""),
-            e.get("db",""),
-            e.get("table",""),
-            e.get("details",""),
-            e.get("meta",{}).get("Binlog File",""),
-            e.get("meta",{}).get("Binlog Position",""),
-            e.get("meta",{}).get("MySQL User",""),
-            e.get("meta",{}).get("Verification",""),
+            e.get("id", ""),
+            e.get("time", ""),
+            e.get("event", ""),
+            e.get("db", ""),
+            e.get("table", ""),
+            e.get("details", ""),
+            e.get("meta", {}).get("Binlog File", ""),
+            e.get("meta", {}).get("Binlog Position", ""),
+            e.get("meta", {}).get("MySQL User", ""),
+            e.get("meta", {}).get("Verification", ""),
         ])
 
-    csv_bytes = buf.getvalue().encode("utf-8-sig")   # utf-8-sig = Excel-friendly BOM
+    # Convert to bytes (Excel-friendly)
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
 
+    # File name
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
         fname += f"_{ev_f.lower()}"
@@ -998,24 +1011,19 @@ def api_export_csv():
         fname += f"_{db_f}"
     fname += ".csv"
 
+    # Return response
     return Response(
         csv_bytes,
         status=200,
-        mimetype="text/csv; charset=utf-8",
+        mimetype="text/csv",
         headers={
-            # RFC 5987 encoding prevents proxy from misreading filename
-            "Content-Disposition":    f"attachment; filename=\"{fname}\"; filename*=UTF-8''{fname}",
-            "Content-Length":         str(len(csv_bytes)),
-            "Content-Type":           "text/csv; charset=utf-8",
-            # Tell Render / Cloudflare / any CDN: do NOT cache or transform this response
-            "Cache-Control":          "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma":                 "no-cache",
-            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f"attachment; filename={fname}",
+            "Content-Length": str(len(csv_bytes)),
+            "Cache-Control": "no-store"
         }
     )
 
-@app.route("/api/export/csv", methods=["GET"])
-def api_export_csv():
+:
 
 # ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
