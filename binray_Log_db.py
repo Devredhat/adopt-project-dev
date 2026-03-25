@@ -943,7 +943,9 @@ def api_table_stats():
 
 
 # ─────────────────────────────────────────────────────────────
-#  FIX 3 — CSV EXPORT (proper streaming, works on Render/gunicorn)
+#  CSV EXPORT — fully buffered in memory so Render/gunicorn can
+#  set Content-Length and the browser gets a real file download,
+#  not a ".csv.htm" proxy artefact.
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/export/csv", methods=["GET"])
 def api_export_csv():
@@ -965,28 +967,27 @@ def api_export_csv():
             search in e.get("details","").lower()
         )]
 
-    def generate():
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["ID","Time","Event","Database","Table","Details",
-                          "Binlog File","Binlog Position","MySQL User","Verification"])
-        yield output.getvalue()
-        for e in evs:
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow([
-                e.get("id",""),
-                e.get("time",""),
-                e.get("event",""),
-                e.get("db",""),
-                e.get("table",""),
-                e.get("details",""),
-                e.get("meta",{}).get("Binlog File",""),
-                e.get("meta",{}).get("Binlog Position",""),
-                e.get("meta",{}).get("MySQL User",""),
-                e.get("meta",{}).get("Verification",""),
-            ])
-            yield output.getvalue()
+    # Build the entire CSV into one bytes buffer — this gives us
+    # Content-Length and prevents Render's CDN from sniffing it as HTML.
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["ID","Time","Event","Database","Table","Details",
+                     "Binlog File","Binlog Position","MySQL User","Verification"])
+    for e in evs:
+        writer.writerow([
+            e.get("id",""),
+            e.get("time",""),
+            e.get("event",""),
+            e.get("db",""),
+            e.get("table",""),
+            e.get("details",""),
+            e.get("meta",{}).get("Binlog File",""),
+            e.get("meta",{}).get("Binlog Position",""),
+            e.get("meta",{}).get("MySQL User",""),
+            e.get("meta",{}).get("Verification",""),
+        ])
+
+    csv_bytes = buf.getvalue().encode("utf-8-sig")   # utf-8-sig = Excel-friendly BOM
 
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
@@ -996,10 +997,17 @@ def api_export_csv():
     fname += ".csv"
 
     return Response(
-        generate(),
-        mimetype="text/csv",
+        csv_bytes,
+        status=200,
+        mimetype="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f"attachment; filename={fname}",
+            # RFC 5987 encoding prevents proxy from misreading filename
+            "Content-Disposition":    f"attachment; filename=\"{fname}\"; filename*=UTF-8''{fname}",
+            "Content-Length":         str(len(csv_bytes)),
+            "Content-Type":           "text/csv; charset=utf-8",
+            # Tell Render / Cloudflare / any CDN: do NOT cache or transform this response
+            "Cache-Control":          "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma":                 "no-cache",
             "X-Content-Type-Options": "nosniff",
         }
     )
@@ -1282,146 +1290,235 @@ function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.fl
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 
-/* FIX 3 — CSV export triggers a real file download */
-function exportCSV(){
+/* FIX — CSV: fetch as blob, then force-download via object URL.
+   This bypasses Render's CDN proxy which was renaming .csv → .csv.htm */
+async function exportCSV(){
   const db=activeDB!=='all'?`&db=${encodeURIComponent(activeDB)}`:'';
   const ev=activeFilter!=='ALL'?`&event=${encodeURIComponent(activeFilter)}`:'';
   const s=searchTerm?`&search=${encodeURIComponent(searchTerm)}`:'';
-  const url=`/api/export/csv?limit=5000${db}${ev}${s}`;
-  const a=document.createElement('a');
-  a.href=url;
-  a.download='';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  const url=`/api/export/csv?${db}${ev}${s}`.replace(/^&/,'');
+  try{
+    const resp=await fetch(url);
+    if(!resp.ok){alert('Export failed: '+resp.status);return;}
+    const blob=await resp.blob();
+    const fname=(resp.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)"?/);
+    const objUrl=URL.createObjectURL(new Blob([blob],{type:'text/csv;charset=utf-8'}));
+    const a=document.createElement('a');
+    a.href=objUrl;
+    a.download=fname?fname[1]:'adopt_events.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{URL.revokeObjectURL(objUrl);document.body.removeChild(a);},2000);
+  }catch(err){alert('Export error: '+err);}
 }
 
-/* ── FIX 4 — Per-event flowchart SVG generator ── */
+/* ── Per-event flowchart — plain English, shows WHAT happened to THIS record ── */
 function buildFlowchart(e){
   const COLOR={INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'};
-  const ICON={INSERT:'➕',UPDATE:'✏️',DELETE:'🗑️',SOFT_DELETE:'🚫',RESTORE:'♻️'};
   const c=COLOR[e.event]||'#6366f1';
-  const ic=ICON[e.event]||'📢';
 
-  /* Build a list of flowchart steps based on event type */
+  /* ── Helper: pick the most meaningful identity field from the record ── */
+  function recordId(rec){
+    if(!rec) return '';
+    const idKeys=['id','ID','name','Name','email','Email','username','Username',
+                  'mobile','phone','customerId','customer_id','accountId','account_id',
+                  'firstName','first_name','fullName','full_name'];
+    for(const k of idKeys){ if(rec[k] && String(rec[k]).trim()) return String(rec[k]).trim().slice(0,40); }
+    const first=Object.values(rec).find(v=>v && String(v).trim());
+    return first ? String(first).trim().slice(0,40) : '';
+  }
+
+  /* ── Helper: summarise what changed in an update ── */
+  function changedSummary(diff){
+    if(!diff||!diff.length) return 'No fields changed';
+    const parts=diff.slice(0,3).map(d=>`${d.field}: "${d.before||'—'}" → "${d.after||'—'}"`);
+    return parts.join(' | ')+(diff.length>3?` (+${diff.length-3} more)`:'');
+  }
+
+  /* ── Helper: truncate long strings for SVG display ── */
+  function trunc(s,n=42){ return s && s.length>n ? s.slice(0,n-1)+'…' : (s||''); }
+
+  const db=e.db, tbl=e.table, rid=recordId(e.record);
+  const ridLine=rid?`Record: ${trunc(rid)}`:'';
+
+  /* ── Build plain-English steps per event type ── */
   let steps=[];
+
   if(e.event==='INSERT'){
     steps=[
-      {label:'MySQL Client',sub:'Application / user triggers change',color:'#1a2540'},
-      {label:'Binlog Writer',sub:'InnoDB writes row to binary log',color:'#1a2540'},
-      {label:'Row Captured',sub:'WriteRowsEvent received by CDC',color:'#22d87a22',border:'#22d87a'},
-      {label:'Column Resolved',sub:'UNKNOWN_COL names mapped via cache',color:'#1a2540'},
-      {label:'Dedup Check',sub:'Content hash verified — not duplicate',color:'#1a2540'},
-      {label:'Event Pushed',sub:'push_event("INSERT") → in-memory store',color:'#22d87a22',border:'#22d87a'},
-      {label:'Notifications',sub:'Email + WhatsApp + Slack (if customer)',color:'#6366f122',border:'#6366f1'},
-      {label:'UI Updated',sub:'Dashboard shows new INSERT row',color:'#22d87a22',border:'#22d87a'},
+      {icon:'🗄️', label:'Where it happened',
+       line1:`Database: ${db}`,
+       line2:`Table: ${tbl}`,
+       color:'#22d87a18',border:'#22d87a'},
+      {icon:'➕', label:'What happened',
+       line1:'A NEW record was added to the table.',
+       line2:ridLine||'New row created successfully.',
+       color:'#22d87a18',border:'#22d87a'},
+      {icon:'📋', label:'What data was saved',
+       line1:trunc(e.details||'Record fields stored in database.'),
+       line2:'All columns written to the table.',
+       color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified',
+       line1:'Email alert sent to the team.',
+       line2:'WhatsApp + Slack message fired.',
+       color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result',
+       line1:'Record is now live in the database.',
+       line2:'Visible here in the monitor dashboard.',
+       color:'#22d87a18',border:'#22d87a'},
     ];
   } else if(e.event==='UPDATE'){
+    const chg=changedSummary(e.diff);
     steps=[
-      {label:'MySQL Client',sub:'Application updates existing row',color:'#1a2540'},
-      {label:'Binlog Writer',sub:'UpdateRowsEvent written to binlog',color:'#1a2540'},
-      {label:'Row Captured',sub:'before_values + after_values received',color:'#f59e0b22',border:'#f59e0b'},
-      {label:'is_delete Check',sub:'Checks is_delete flag for soft-del / restore',color:'#1a2540'},
-      {label:'Diff Computed',sub:'build_diff() → changed fields only',color:'#1a2540'},
-      {label:'Event Pushed',sub:'push_event("UPDATE") → in-memory store',color:'#f59e0b22',border:'#f59e0b'},
-      {label:'Notifications',sub:'Slack only (if on_update enabled)',color:'#6366f122',border:'#6366f1'},
-      {label:'UI Updated',sub:'Dashboard shows UPDATE with diff',color:'#f59e0b22',border:'#f59e0b'},
+      {icon:'🗄️', label:'Where it happened',
+       line1:`Database: ${db}`,
+       line2:`Table: ${tbl}`,
+       color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'✏️', label:'What happened',
+       line1:'An existing record was MODIFIED.',
+       line2:ridLine||'Existing row updated.',
+       color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'🔄', label:'What changed',
+       line1:trunc(chg,50),
+       line2:`${e.diff?e.diff.length:0} field(s) were updated.`,
+       color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified',
+       line1:'Slack channel was notified.',
+       line2:'(Email/WA only if configured for updates)',
+       color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result',
+       line1:'Record now holds the new values.',
+       line2:'Old values are logged above in diff.',
+       color:'#f59e0b18',border:'#f59e0b'},
     ];
   } else if(e.event==='SOFT_DELETE'){
     steps=[
-      {label:'MySQL Client',sub:'App sets is_delete = 1 on row',color:'#1a2540'},
-      {label:'Binlog Writer',sub:'UpdateRowsEvent written to binlog',color:'#1a2540'},
-      {label:'Row Captured',sub:'CDC sees UPDATE event',color:'#a78bfa22',border:'#a78bfa'},
-      {label:'is_delete Check',sub:'before=0, after=1 → SOFT_DELETE path',color:'#a78bfa22',border:'#a78bfa'},
-      {label:'Diff Computed',sub:'build_diff() captures is_delete change',color:'#1a2540'},
-      {label:'Event Pushed',sub:'push_event("SOFT_DELETE") → store',color:'#a78bfa22',border:'#a78bfa'},
-      {label:'Notifications',sub:'Email + WhatsApp + Slack (soft-del alerts)',color:'#6366f122',border:'#6366f1'},
-      {label:'UI Updated',sub:'Dashboard shows SOFT DELETE row',color:'#a78bfa22',border:'#a78bfa'},
+      {icon:'🗄️', label:'Where it happened',
+       line1:`Database: ${db}`,
+       line2:`Table: ${tbl}`,
+       color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'🚫', label:'What happened',
+       line1:'A record was marked as DELETED',
+       line2:'(but NOT physically removed from DB).',
+       color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'🔍', label:'Which record',
+       line1:ridLine||trunc(e.details||''),
+       line2:'is_delete flag set to 1 (hidden from app).',
+       color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified',
+       line1:'Email + WhatsApp + Slack notified.',
+       line2:'Team alerted about the soft-deletion.',
+       color:'#6366f118',border:'#6366f1'},
+      {icon:'💡', label:'What this means',
+       line1:'Record still exists — can be restored.',
+       line2:'Use RESTORE action to bring it back.',
+       color:'#a78bfa18',border:'#a78bfa'},
     ];
   } else if(e.event==='RESTORE'){
     steps=[
-      {label:'MySQL Client',sub:'App sets is_delete = 0 on row',color:'#1a2540'},
-      {label:'Binlog Writer',sub:'UpdateRowsEvent written to binlog',color:'#1a2540'},
-      {label:'Row Captured',sub:'CDC sees UPDATE event',color:'#38bdf822',border:'#38bdf8'},
-      {label:'is_delete Check',sub:'before=1, after=0 → RESTORE path',color:'#38bdf822',border:'#38bdf8'},
-      {label:'Event Pushed',sub:'push_event("RESTORE") → store',color:'#38bdf822',border:'#38bdf8'},
-      {label:'Notifications',sub:'Slack / WA only if on_restore=True',color:'#6366f122',border:'#6366f1'},
-      {label:'UI Updated',sub:'Dashboard shows RESTORE row',color:'#38bdf822',border:'#38bdf8'},
+      {icon:'🗄️', label:'Where it happened',
+       line1:`Database: ${db}`,
+       line2:`Table: ${tbl}`,
+       color:'#38bdf818',border:'#38bdf8'},
+      {icon:'♻️', label:'What happened',
+       line1:'A previously deleted record was RESTORED.',
+       line2:'It is active and visible in the app again.',
+       color:'#38bdf818',border:'#38bdf8'},
+      {icon:'🔍', label:'Which record',
+       line1:ridLine||trunc(e.details||''),
+       line2:'is_delete flag changed from 1 back to 0.',
+       color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified',
+       line1:'Slack / WhatsApp notified (if enabled).',
+       line2:'Team alerted about the restoration.',
+       color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result',
+       line1:'Record is now fully active again.',
+       line2:'Visible to users in the application.',
+       color:'#38bdf818',border:'#38bdf8'},
     ];
   } else { /* DELETE */
+    const verified=e.meta&&e.meta['Verification']||'';
+    const verLine=verified?trunc(verified,48):'Confirmed — record gone from database.';
     steps=[
-      {label:'MySQL Client',sub:'Application / user hard-deletes row',color:'#1a2540'},
-      {label:'Binlog Writer',sub:'DeleteRowsEvent written to binlog',color:'#1a2540'},
-      {label:'Row Captured',sub:'CDC receives DeleteRowsEvent',color:'#f43f5e22',border:'#f43f5e'},
-      {label:'Dedup Check',sub:'Content hash — not seen in last 60s',color:'#1a2540'},
-      {label:'Verify Thread',sub:'4-sec wait → re-query MySQL by PK',color:'#f59e0b22',border:'#f59e0b'},
-      {label:'DB Confirmation',sub:'Record missing → CONFIRMED real delete',color:'#f43f5e22',border:'#f43f5e'},
-      {label:'Event Pushed',sub:'push_event("DELETE") → in-memory store',color:'#f43f5e22',border:'#f43f5e'},
-      {label:'Notifications',sub:'Email + WhatsApp + Slack fired',color:'#6366f122',border:'#6366f1'},
-      {label:'UI Updated',sub:'Dashboard shows DELETE row permanently',color:'#f43f5e22',border:'#f43f5e'},
+      {icon:'🗄️', label:'Where it happened',
+       line1:`Database: ${db}`,
+       line2:`Table: ${tbl}`,
+       color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🗑️', label:'What happened',
+       line1:'A record was PERMANENTLY DELETED.',
+       line2:'This action CANNOT be undone.',
+       color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🔍', label:'Which record was deleted',
+       line1:ridLine||trunc(e.details||''),
+       line2:'Row removed from the table completely.',
+       color:'#0f162388',border:'#2a3a55'},
+      {icon:'🛡️', label:'Deletion verified',
+       line1:verLine,
+       line2:'System double-checked before alerting.',
+       color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'📣', label:'Who was notified',
+       line1:'⚠️ Email + WhatsApp + Slack alerted.',
+       line2:'High-priority alert sent to the team.',
+       color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'❌', label:'Final result',
+       line1:'Record is gone — no longer in database.',
+       line2:'Restore from backup if needed.',
+       color:'#f43f5e18',border:'#f43f5e'},
     ];
   }
 
-  /* 2-column layout: left column steps 0..N/2-1, right column steps N/2..N */
-  const half=Math.ceil(steps.length/2);
-  const leftSteps=steps.slice(0,half);
-  const rightSteps=steps.slice(half);
-  const BOX_W=260, BOX_H=52, GAP_Y=22, COL_GAP=80;
-  const LEFT_X=30, RIGHT_X=LEFT_X+BOX_W+COL_GAP;
-  const totalH=Math.max(leftSteps.length,rightSteps.length)*(BOX_H+GAP_Y)+GAP_Y;
-  const SVG_H=totalH+100; /* header + footer space */
+  /* ── Layout: single vertical column, wide boxes ── */
+  const BOX_W=580, BOX_H=62, GAP_Y=16, START_X=40, HEADER_H=70;
+  const SVG_W=660;
+  const SVG_H=HEADER_H + steps.length*(BOX_H+GAP_Y) + 50;
 
-  let svg=`<svg width="660" viewBox="0 0 660 ${SVG_H}" xmlns="http://www.w3.org/2000/svg" style="font-family:JetBrains Mono,monospace">`;
-  svg+=`<defs><marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M2 1L8 5L2 9" fill="none" stroke="#4a5a75" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>`;
+  let svg=`<svg width="${SVG_W}" viewBox="0 0 ${SVG_W} ${SVG_H}" xmlns="http://www.w3.org/2000/svg" style="font-family:JetBrains Mono,monospace;max-width:100%">`;
+  svg+=`<defs><marker id="arrd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M2 1L8 5L2 9" fill="none" stroke="#2a3a55" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>`;
 
-  /* Header */
-  svg+=`<rect x="10" y="10" width="640" height="46" rx="8" fill="${c}22" stroke="${c}" stroke-width="1"/>`;
-  svg+=`<text x="330" y="28" text-anchor="middle" fill="${c}" font-size="11" font-weight="700">${ic} EVENT FLOW — ${e.event.replace('_',' ')} : ${e.db} . ${e.table}</text>`;
-  svg+=`<text x="330" y="46" text-anchor="middle" fill="#4a5a75" font-size="10">${e.time}  |  Event #${e.id}</text>`;
+  /* Header banner */
+  const LABEL={INSERT:'New Record Added',UPDATE:'Record Modified',DELETE:'Record Permanently Deleted',SOFT_DELETE:'Record Hidden (Soft Delete)',RESTORE:'Record Restored'};
+  svg+=`<rect x="0" y="0" width="${SVG_W}" height="${HEADER_H}" rx="0" fill="${c}18"/>`;
+  svg+=`<rect x="0" y="${HEADER_H-2}" width="${SVG_W}" height="2" fill="${c}44"/>`;
+  svg+=`<text x="30" y="28" fill="${c}" font-size="15" font-weight="700">${LABEL[e.event]||e.event}</text>`;
+  svg+=`<text x="30" y="46" fill="#7a94b8" font-size="11">Database: ${db}   |   Table: ${tbl}   |   Time: ${e.time}   |   Event #${e.id}</text>`;
+  svg+=`<text x="30" y="62" fill="#4a5a75" font-size="10">Click any step for detail — scroll down to see full record data</text>`;
 
-  /* Column headers */
-  const startY=76;
-  svg+=`<text x="${LEFT_X+BOX_W/2}" y="${startY-8}" text-anchor="middle" fill="#4a5a75" font-size="9" letter-spacing="1">ROOT → MIDWAY</text>`;
-  svg+=`<text x="${RIGHT_X+BOX_W/2}" y="${startY-8}" text-anchor="middle" fill="#4a5a75" font-size="9" letter-spacing="1">MIDWAY → OUTCOME</text>`;
+  /* Steps */
+  steps.forEach((step,i)=>{
+    const bx=START_X, by=HEADER_H+8+i*(BOX_H+GAP_Y);
+    const bc=step.border||'#2a3a55';
+    const mx=bx+BOX_W/2;
 
-  function renderColumn(colSteps, colX, startY){
-    let out='';
-    colSteps.forEach((step,i)=>{
-      const bx=colX, by=startY+i*(BOX_H+GAP_Y);
-      const bc=step.border||'#1a2540';
-      const stepNum=i+1;
-      out+=`<rect x="${bx}" y="${by}" width="${BOX_W}" height="${BOX_H}" rx="6" fill="${step.color||'#1a2540'}" stroke="${bc}" stroke-width="1"/>`;
-      out+=`<circle cx="${bx+14}" cy="${by+BOX_H/2}" r="9" fill="${bc}33" stroke="${bc}" stroke-width="0.8"/>`;
-      out+=`<text x="${bx+14}" y="${by+BOX_H/2+1}" text-anchor="middle" dominant-baseline="middle" fill="${bc}" font-size="9" font-weight="700">${stepNum}</text>`;
-      out+=`<text x="${bx+30}" y="${by+18}" fill="#c0cfe8" font-size="11" font-weight="700">${step.label}</text>`;
-      out+=`<text x="${bx+30}" y="${by+34}" fill="#4a5a75" font-size="9">${step.sub}</text>`;
-      /* Arrow down to next step */
-      if(i<colSteps.length-1){
-        const ay=by+BOX_H+2, ay2=by+BOX_H+GAP_Y-2;
-        const ax=bx+BOX_W/2;
-        out+=`<line x1="${ax}" y1="${ay}" x2="${ax}" y2="${ay2}" stroke="#1a2540" stroke-width="1.5" marker-end="url(#arr)"/>`;
-      }
-      return out;
-    });
-    return out;
-  }
+    /* Box */
+    svg+=`<rect x="${bx}" y="${by}" width="${BOX_W}" height="${BOX_H}" rx="8" fill="${step.color||'#0f162388'}" stroke="${bc}" stroke-width="1"/>`;
 
-  svg+=renderColumn(leftSteps, LEFT_X, startY);
-  svg+=renderColumn(rightSteps, RIGHT_X, startY);
+    /* Step number circle */
+    svg+=`<circle cx="${bx+20}" cy="${by+BOX_H/2}" r="12" fill="${bc}33" stroke="${bc}" stroke-width="1"/>`;
+    svg+=`<text x="${bx+20}" y="${by+BOX_H/2+1}" text-anchor="middle" dominant-baseline="middle" fill="${bc}" font-size="10" font-weight="700">${i+1}</text>`;
 
-  /* Bridge arrow from end of left column to start of right column */
-  const leftEndY = startY + (leftSteps.length-1)*(BOX_H+GAP_Y) + BOX_H/2;
-  const rightStartY = startY + BOX_H/2;
-  const bridgeX1 = LEFT_X + BOX_W + 4;
-  const bridgeX2 = RIGHT_X - 4;
-  const bridgeMidX = LEFT_X + BOX_W + COL_GAP/2;
-  svg+=`<path d="M${bridgeX1} ${leftEndY} L${bridgeMidX} ${leftEndY} L${bridgeMidX} ${rightStartY} L${bridgeX2} ${rightStartY}" fill="none" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr)"/>`;
-  svg+=`<text x="${bridgeMidX}" y="${(leftEndY+rightStartY)/2}" text-anchor="middle" fill="#6366f1" font-size="9" transform="rotate(-90,${bridgeMidX},${(leftEndY+rightStartY)/2})">continues</text>`;
+    /* Icon */
+    svg+=`<text x="${bx+44}" y="${by+BOX_H/2-6}" dominant-baseline="middle" font-size="16">${step.icon}</text>`;
+
+    /* Step label (title) */
+    svg+=`<text x="${bx+68}" y="${by+20}" fill="#ffffff" font-size="11" font-weight="700">${step.label}</text>`;
+
+    /* Line 1 */
+    svg+=`<text x="${bx+68}" y="${by+36}" fill="#c0cfe8" font-size="10">${step.line1}</text>`;
+
+    /* Line 2 */
+    svg+=`<text x="${bx+68}" y="${by+50}" fill="#4a5a75" font-size="9">${step.line2}</text>`;
+
+    /* Connector arrow to next */
+    if(i<steps.length-1){
+      const ay=by+BOX_H+2, ay2=by+BOX_H+GAP_Y-2;
+      svg+=`<line x1="${mx}" y1="${ay}" x2="${mx}" y2="${ay2}" stroke="#2a3a55" stroke-width="1.5" marker-end="url(#arrd)"/>`;
+    }
+  });
 
   /* Footer */
-  const footY = startY + Math.max(leftSteps.length,rightSteps.length)*(BOX_H+GAP_Y) + 10;
-  svg+=`<rect x="10" y="${footY}" width="640" height="30" rx="6" fill="#0f162388" stroke="#1a2540" stroke-width="1"/>`;
-  svg+=`<text x="330" y="${footY+19}" text-anchor="middle" fill="#4a5a75" font-size="9">ADOPT Database Monitor v3  —  Binlog CDC  —  ${e.meta&&e.meta['Binlog File']?e.meta['Binlog File']:''}</text>`;
+  const footY=HEADER_H+8+steps.length*(BOX_H+GAP_Y)+4;
+  svg+=`<text x="${SVG_W/2}" y="${footY+12}" text-anchor="middle" fill="#2a3a55" font-size="9">ADOPT Database Monitor v3  —  ${e.meta&&e.meta['Binlog File']?e.meta['Binlog File']:''}</text>`;
 
   svg+=`</svg>`;
   return svg;
