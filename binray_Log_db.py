@@ -375,7 +375,7 @@ def send_whatsapp(event_type, db, table, record=None, diff=None, event_id=None):
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("*Changes:*")
         for d in diff[:5]:
-            lines.append(f"• {d['field']}: {d['before'] or '—'} → {d['after'] or '—'}")
+            lines.append(f"• {d['field']}: {d['before'] or '-'} -> {d['after'] or '-'}")
     if event_type == "DELETE":
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("⚠️ *PERMANENTLY DELETED*")
@@ -830,7 +830,7 @@ def binlog_monitor():
                         else:
                             if diff:
                                 detail = "Changed: " + " | ".join(
-                                    f"{d['field']}: {d['before']} → {d['after']}" for d in diff)
+                                    f"{d['field']}: {d['before']} -> {d['after']}" for d in diff)
                             else:
                                 detail = "No column changes"
                             print(f"  [UPDATE] {db}.{table}")
@@ -963,7 +963,7 @@ def api_export_csv():
             e.get("meta",{}).get("Verification",""),
         ])
 
-    csv_bytes = buf.getvalue().encode("utf-8-sig")
+    csv_bytes = buf.getvalue().encode("utf-8")   # plain utf-8 — arrows replaced with ASCII ->
 
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
