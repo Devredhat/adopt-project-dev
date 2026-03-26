@@ -10,6 +10,9 @@
 #   3) CSV export 404 fixed — route now handles all filter combos
 #      and uses streaming response correctly on Render/gunicorn
 #   4) Per-event flowchart diagram added in event detail modal
+#   5) CSV export 404 via proxy fixed — exportCSV JS now detects
+#      its own base path dynamically so it works both standalone
+#      (:5000) and through the /tool/binlog/ proxy on Render
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq, Response
@@ -115,40 +118,18 @@ def load_binlog_position():
 
 # ─────────────────────────────────────────────────────────────
 #  FIX 1 — EVENT DEDUPLICATION (content-hash based, NOT log_pos)
-#
-#  ROOT CAUSE of disappearing DELETE/SOFT_DELETE events:
-#  The old dedup key used (log_pos, db, table, event_type, row_repr).
-#  After a reconnect the binlog stream replays events from the
-#  saved position. Because the same log_pos appears again, the
-#  dedup cache marks those events as "already seen" and drops them.
-#  For DELETE events this is catastrophic because:
-#    a) The DELETE arrives → queued to verify_delete_and_push thread
-#    b) Reconnect happens before the 4-second wait finishes
-#    c) Same DELETE replays → dedup blocks it → verify thread pushes
-#       the original event → but a second genuine DELETE later is
-#       also blocked because the content hash matches.
-#
-#  FIX: Key the dedup on a CONTENT HASH only (db + table + event_type
-#  + sorted row values).  Use a short TTL (60 seconds via timestamp
-#  bucket) so the same row can legitimately be deleted again later.
 # ─────────────────────────────────────────────────────────────
-_seen_events: dict = {}        # key → unix-minute bucket
+_seen_events: dict = {}
 _seen_events_lock = threading.Lock()
 MAX_SEEN_EVENTS = 20_000
 
 def _content_key(db: str, table: str, event_type: str, row: dict) -> str:
-    """
-    Stable fingerprint that does NOT include log_pos.
-    Uses a 60-second time bucket so the same change cannot fire
-    twice within the same minute, but CAN fire again in a later minute.
-    """
     try:
         row_hash = hashlib.md5(
             json.dumps(sorted(row.items()), default=str).encode()
         ).hexdigest()[:16]
     except Exception:
         row_hash = "?"
-    # 60-second bucket: events in the same minute share a bucket
     minute_bucket = int(time.time()) // 60
     return f"{minute_bucket}:{db}:{table}:{event_type}:{row_hash}"
 
@@ -158,9 +139,8 @@ def is_duplicate_event(db: str, table: str, event_type: str, row: dict) -> bool:
         if key in _seen_events:
             return True
         _seen_events[key] = int(time.time())
-        # Evict old entries to cap memory
         if len(_seen_events) > MAX_SEEN_EVENTS:
-            cutoff = int(time.time()) - 120   # keep last 2 minutes
+            cutoff = int(time.time()) - 120
             expired = [k for k, t in _seen_events.items() if t < cutoff]
             for k in expired:
                 del _seen_events[k]
@@ -198,7 +178,7 @@ STATE = {
 
 _col_cache = {}
 _event_id  = 0
-_state_lock = threading.Lock()   # protect _event_id and STATE["events"]
+_state_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -943,9 +923,7 @@ def api_table_stats():
 
 
 # ─────────────────────────────────────────────────────────────
-#  CSV EXPORT — fully buffered in memory so Render/gunicorn can
-#  set Content-Length and the browser gets a real file download,
-#  not a ".csv.htm" proxy artefact.
+#  CSV EXPORT — fully buffered in memory
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/export/csv", methods=["GET"])
 def api_export_csv():
@@ -967,8 +945,6 @@ def api_export_csv():
             search in e.get("details","").lower()
         )]
 
-    # Build the entire CSV into one bytes buffer — this gives us
-    # Content-Length and prevents Render's CDN from sniffing it as HTML.
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["ID","Time","Event","Database","Table","Details",
@@ -987,7 +963,7 @@ def api_export_csv():
             e.get("meta",{}).get("Verification",""),
         ])
 
-    csv_bytes = buf.getvalue().encode("utf-8-sig")   # utf-8-sig = Excel-friendly BOM
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
 
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
@@ -1001,11 +977,9 @@ def api_export_csv():
         status=200,
         mimetype="text/csv; charset=utf-8",
         headers={
-            # RFC 5987 encoding prevents proxy from misreading filename
             "Content-Disposition":    f"attachment; filename=\"{fname}\"; filename*=UTF-8''{fname}",
             "Content-Length":         str(len(csv_bytes)),
             "Content-Type":           "text/csv; charset=utf-8",
-            # Tell Render / Cloudflare / any CDN: do NOT cache or transform this response
             "Cache-Control":          "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma":                 "no-cache",
             "X-Content-Type-Options": "nosniff",
@@ -1053,21 +1027,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .info-bar{display:flex;gap:10px;padding:12px 24px;background:var(--surf2);border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:10px;color:var(--muted)}
 .info-item{display:flex;gap:5px;align-items:center}
 .info-item span{color:var(--text)}
-
-/* FIX 2 — metric boxes: fluid font-size so large numbers never overflow */
 .metrics{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
 .metric{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px 16px;flex:1;min-width:110px;cursor:default;transition:border-color .2s;overflow:hidden}
 .metric:hover{border-color:var(--acc)}
 .metric-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.metric-val{
-  font-weight:700;
-  font-family:'Syne',sans-serif;
-  /* clamp: shrinks from 22px down to 13px as box narrows */
-  font-size:clamp(13px,2.4vw,22px);
-  word-break:break-all;
-  line-height:1.1;
-}
-
+.metric-val{font-weight:700;font-family:'Syne',sans-serif;font-size:clamp(13px,2.4vw,22px);word-break:break-all;line-height:1.1;}
 .c-ins{color:var(--ins)}.c-upd{color:var(--upd)}.c-del{color:var(--del)}
 .c-soft{color:var(--soft)}.c-rest{color:var(--rest)}.c-w{color:#fff}.c-wa{color:var(--wa)}
 .c-em{color:#f59e0b}.c-sl{color:var(--sl)}
@@ -1134,8 +1098,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .tbl-row:hover{background:#ffffff04}
 .tbl-bar-wrap{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .tbl-bar{height:4px;background:var(--acc);border-radius:2px;transition:width .3s}
-
-/* ── MODAL ── */
 .modal-overlay{display:none;position:fixed;inset:0;background:#000000bb;z-index:200;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.open{display:flex}
 .modal{background:var(--surf);border:1px solid var(--border);border-radius:12px;max-width:800px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;position:relative}
@@ -1156,11 +1118,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .rec-table td{padding:5px 10px;border-bottom:1px solid var(--border);vertical-align:top}
 .rec-table td:first-child{color:var(--muted);width:180px;white-space:nowrap}
 .rec-table td:last-child{color:#fff;word-break:break-word}
-
-/* FIX 4 — Flowchart diagram in modal */
 .flow-wrap{margin-top:10px;overflow-x:auto;border-radius:8px;background:var(--surf2);padding:16px}
 .flow-wrap svg{display:block;margin:0 auto}
-
 .footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
 </style>
 </head>
@@ -1290,272 +1249,158 @@ function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.fl
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 
-/* FIX — CSV: fetch as blob, then force-download via object URL.
-   This bypasses Render's CDN proxy which was renaming .csv → .csv.htm */
+// ─────────────────────────────────────────────────────────────
+// FIX 5 — CSV EXPORT: detect our own base path so this works
+// both when accessed directly on :5000 AND via the /tool/binlog/
+// proxy on Render. We look at window.location.pathname to figure
+// out the correct API prefix instead of hard-coding '/api/'.
+// ─────────────────────────────────────────────────────────────
 async function exportCSV(){
   const params = new URLSearchParams();
+  if (activeDB !== 'all')    params.append('db',     activeDB);
+  if (activeFilter !== 'ALL') params.append('event',  activeFilter);
+  if (searchTerm)             params.append('search', searchTerm);
 
-  if (activeDB !== 'all') params.append('db', activeDB);
-  if (activeFilter !== 'ALL') params.append('event', activeFilter);
-  if (searchTerm) params.append('search', searchTerm);
+  // Detect whether we are running behind the proxy or standalone.
+  // Behind proxy: pathname starts with /tool/binlog/
+  // Standalone:   pathname is just /
+  const pathParts = window.location.pathname.split('/').filter(Boolean);
+  // pathParts behind proxy = ['tool', 'binlog', ...]
+  // pathParts standalone   = []
+  let apiBase = '';
+  if (pathParts.length >= 2 && pathParts[0] === 'tool') {
+    // We are inside a proxy — prefix API calls with /tool/<name>
+    apiBase = '/' + pathParts[0] + '/' + pathParts[1];
+  }
+  // apiBase is now either '' (standalone) or '/tool/binlog' (proxy)
 
   const query = params.toString();
+  const url   = apiBase + '/api/export/csv' + (query ? '?' + query : '');
 
-  // ✅ FIX
-  const url = query ? `/api/export/csv?${query}` : `/api/export/csv`;
-
-  try{
+  try {
     const resp = await fetch(url);
-
-    if(!resp.ok){
-      alert('Export failed: ' + resp.status);
+    if (!resp.ok) {
+      alert('Export failed: ' + resp.status + ' — URL tried: ' + url);
       return;
     }
-
-    const blob = await resp.blob();
+    const blob   = await resp.blob();
     const objUrl = URL.createObjectURL(blob);
-
-    const a = document.createElement('a');
-    a.href = objUrl;
-    a.download = 'adopt_events.csv';
+    const a      = document.createElement('a');
+    a.href       = objUrl;
+    a.download   = 'adopt_events.csv';
     document.body.appendChild(a);
     a.click();
-
-    setTimeout(()=>{
-      URL.revokeObjectURL(objUrl);
-      document.body.removeChild(a);
-    }, 2000);
-
-  }catch(err){
+    setTimeout(() => { URL.revokeObjectURL(objUrl); document.body.removeChild(a); }, 2000);
+  } catch(err) {
     alert('Export error: ' + err);
   }
 }
 
-/* ── Per-event flowchart — plain English, shows WHAT happened to THIS record ── */
+/* ── Per-event flowchart ── */
 function buildFlowchart(e){
   const COLOR={INSERT:'#22d87a',UPDATE:'#f59e0b',DELETE:'#f43f5e',SOFT_DELETE:'#a78bfa',RESTORE:'#38bdf8'};
   const c=COLOR[e.event]||'#6366f1';
-
-  /* ── Helper: pick the most meaningful identity field from the record ── */
   function recordId(rec){
     if(!rec) return '';
-    const idKeys=['id','ID','name','Name','email','Email','username','Username',
-                  'mobile','phone','customerId','customer_id','accountId','account_id',
-                  'firstName','first_name','fullName','full_name'];
+    const idKeys=['id','ID','name','Name','email','Email','username','Username','mobile','phone','customerId','customer_id','accountId','account_id','firstName','first_name','fullName','full_name'];
     for(const k of idKeys){ if(rec[k] && String(rec[k]).trim()) return String(rec[k]).trim().slice(0,40); }
     const first=Object.values(rec).find(v=>v && String(v).trim());
     return first ? String(first).trim().slice(0,40) : '';
   }
-
-  /* ── Helper: summarise what changed in an update ── */
   function changedSummary(diff){
     if(!diff||!diff.length) return 'No fields changed';
     const parts=diff.slice(0,3).map(d=>`${d.field}: "${d.before||'—'}" → "${d.after||'—'}"`);
     return parts.join(' | ')+(diff.length>3?` (+${diff.length-3} more)`:'');
   }
-
-  /* ── Helper: truncate long strings for SVG display ── */
   function trunc(s,n=42){ return s && s.length>n ? s.slice(0,n-1)+'…' : (s||''); }
-
   const db=e.db, tbl=e.table, rid=recordId(e.record);
   const ridLine=rid?`Record: ${trunc(rid)}`:'';
-
-  /* ── Build plain-English steps per event type ── */
   let steps=[];
-
   if(e.event==='INSERT'){
     steps=[
-      {icon:'🗄️', label:'Where it happened',
-       line1:`Database: ${db}`,
-       line2:`Table: ${tbl}`,
-       color:'#22d87a18',border:'#22d87a'},
-      {icon:'➕', label:'What happened',
-       line1:'A NEW record was added to the table.',
-       line2:ridLine||'New row created successfully.',
-       color:'#22d87a18',border:'#22d87a'},
-      {icon:'📋', label:'What data was saved',
-       line1:trunc(e.details||'Record fields stored in database.'),
-       line2:'All columns written to the table.',
-       color:'#0f162388',border:'#2a3a55'},
-      {icon:'📣', label:'Who was notified',
-       line1:'Email alert sent to the team.',
-       line2:'WhatsApp + Slack message fired.',
-       color:'#6366f118',border:'#6366f1'},
-      {icon:'✅', label:'Final result',
-       line1:'Record is now live in the database.',
-       line2:'Visible here in the monitor dashboard.',
-       color:'#22d87a18',border:'#22d87a'},
+      {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#22d87a18',border:'#22d87a'},
+      {icon:'➕', label:'What happened', line1:'A NEW record was added to the table.', line2:ridLine||'New row created successfully.', color:'#22d87a18',border:'#22d87a'},
+      {icon:'📋', label:'What data was saved', line1:trunc(e.details||'Record fields stored in database.'), line2:'All columns written to the table.', color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified', line1:'Email alert sent to the team.', line2:'WhatsApp + Slack message fired.', color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result', line1:'Record is now live in the database.', line2:'Visible here in the monitor dashboard.', color:'#22d87a18',border:'#22d87a'},
     ];
   } else if(e.event==='UPDATE'){
     const chg=changedSummary(e.diff);
     steps=[
-      {icon:'🗄️', label:'Where it happened',
-       line1:`Database: ${db}`,
-       line2:`Table: ${tbl}`,
-       color:'#f59e0b18',border:'#f59e0b'},
-      {icon:'✏️', label:'What happened',
-       line1:'An existing record was MODIFIED.',
-       line2:ridLine||'Existing row updated.',
-       color:'#f59e0b18',border:'#f59e0b'},
-      {icon:'🔄', label:'What changed',
-       line1:trunc(chg,50),
-       line2:`${e.diff?e.diff.length:0} field(s) were updated.`,
-       color:'#0f162388',border:'#2a3a55'},
-      {icon:'📣', label:'Who was notified',
-       line1:'Slack channel was notified.',
-       line2:'(Email/WA only if configured for updates)',
-       color:'#6366f118',border:'#6366f1'},
-      {icon:'✅', label:'Final result',
-       line1:'Record now holds the new values.',
-       line2:'Old values are logged above in diff.',
-       color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'✏️', label:'What happened', line1:'An existing record was MODIFIED.', line2:ridLine||'Existing row updated.', color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'🔄', label:'What changed', line1:trunc(chg,50), line2:`${e.diff?e.diff.length:0} field(s) were updated.`, color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified', line1:'Slack channel was notified.', line2:'(Email/WA only if configured for updates)', color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result', line1:'Record now holds the new values.', line2:'Old values are logged above in diff.', color:'#f59e0b18',border:'#f59e0b'},
     ];
   } else if(e.event==='SOFT_DELETE'){
     steps=[
-      {icon:'🗄️', label:'Where it happened',
-       line1:`Database: ${db}`,
-       line2:`Table: ${tbl}`,
-       color:'#a78bfa18',border:'#a78bfa'},
-      {icon:'🚫', label:'What happened',
-       line1:'A record was marked as DELETED',
-       line2:'(but NOT physically removed from DB).',
-       color:'#a78bfa18',border:'#a78bfa'},
-      {icon:'🔍', label:'Which record',
-       line1:ridLine||trunc(e.details||''),
-       line2:'is_delete flag set to 1 (hidden from app).',
-       color:'#0f162388',border:'#2a3a55'},
-      {icon:'📣', label:'Who was notified',
-       line1:'Email + WhatsApp + Slack notified.',
-       line2:'Team alerted about the soft-deletion.',
-       color:'#6366f118',border:'#6366f1'},
-      {icon:'💡', label:'What this means',
-       line1:'Record still exists — can be restored.',
-       line2:'Use RESTORE action to bring it back.',
-       color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'🚫', label:'What happened', line1:'A record was marked as DELETED', line2:'(but NOT physically removed from DB).', color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'🔍', label:'Which record', line1:ridLine||trunc(e.details||''), line2:'is_delete flag set to 1 (hidden from app).', color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified', line1:'Email + WhatsApp + Slack notified.', line2:'Team alerted about the soft-deletion.', color:'#6366f118',border:'#6366f1'},
+      {icon:'💡', label:'What this means', line1:'Record still exists — can be restored.', line2:'Use RESTORE action to bring it back.', color:'#a78bfa18',border:'#a78bfa'},
     ];
   } else if(e.event==='RESTORE'){
     steps=[
-      {icon:'🗄️', label:'Where it happened',
-       line1:`Database: ${db}`,
-       line2:`Table: ${tbl}`,
-       color:'#38bdf818',border:'#38bdf8'},
-      {icon:'♻️', label:'What happened',
-       line1:'A previously deleted record was RESTORED.',
-       line2:'It is active and visible in the app again.',
-       color:'#38bdf818',border:'#38bdf8'},
-      {icon:'🔍', label:'Which record',
-       line1:ridLine||trunc(e.details||''),
-       line2:'is_delete flag changed from 1 back to 0.',
-       color:'#0f162388',border:'#2a3a55'},
-      {icon:'📣', label:'Who was notified',
-       line1:'Slack / WhatsApp notified (if enabled).',
-       line2:'Team alerted about the restoration.',
-       color:'#6366f118',border:'#6366f1'},
-      {icon:'✅', label:'Final result',
-       line1:'Record is now fully active again.',
-       line2:'Visible to users in the application.',
-       color:'#38bdf818',border:'#38bdf8'},
+      {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#38bdf818',border:'#38bdf8'},
+      {icon:'♻️', label:'What happened', line1:'A previously deleted record was RESTORED.', line2:'It is active and visible in the app again.', color:'#38bdf818',border:'#38bdf8'},
+      {icon:'🔍', label:'Which record', line1:ridLine||trunc(e.details||''), line2:'is_delete flag changed from 1 back to 0.', color:'#0f162388',border:'#2a3a55'},
+      {icon:'📣', label:'Who was notified', line1:'Slack / WhatsApp notified (if enabled).', line2:'Team alerted about the restoration.', color:'#6366f118',border:'#6366f1'},
+      {icon:'✅', label:'Final result', line1:'Record is now fully active again.', line2:'Visible to users in the application.', color:'#38bdf818',border:'#38bdf8'},
     ];
-  } else { /* DELETE */
+  } else {
     const verified=e.meta&&e.meta['Verification']||'';
     const verLine=verified?trunc(verified,48):'Confirmed — record gone from database.';
     steps=[
-      {icon:'🗄️', label:'Where it happened',
-       line1:`Database: ${db}`,
-       line2:`Table: ${tbl}`,
-       color:'#f43f5e18',border:'#f43f5e'},
-      {icon:'🗑️', label:'What happened',
-       line1:'A record was PERMANENTLY DELETED.',
-       line2:'This action CANNOT be undone.',
-       color:'#f43f5e18',border:'#f43f5e'},
-      {icon:'🔍', label:'Which record was deleted',
-       line1:ridLine||trunc(e.details||''),
-       line2:'Row removed from the table completely.',
-       color:'#0f162388',border:'#2a3a55'},
-      {icon:'🛡️', label:'Deletion verified',
-       line1:verLine,
-       line2:'System double-checked before alerting.',
-       color:'#f59e0b18',border:'#f59e0b'},
-      {icon:'📣', label:'Who was notified',
-       line1:'⚠️ Email + WhatsApp + Slack alerted.',
-       line2:'High-priority alert sent to the team.',
-       color:'#f43f5e18',border:'#f43f5e'},
-      {icon:'❌', label:'Final result',
-       line1:'Record is gone — no longer in database.',
-       line2:'Restore from backup if needed.',
-       color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🗑️', label:'What happened', line1:'A record was PERMANENTLY DELETED.', line2:'This action CANNOT be undone.', color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🔍', label:'Which record was deleted', line1:ridLine||trunc(e.details||''), line2:'Row removed from the table completely.', color:'#0f162388',border:'#2a3a55'},
+      {icon:'🛡️', label:'Deletion verified', line1:verLine, line2:'System double-checked before alerting.', color:'#f59e0b18',border:'#f59e0b'},
+      {icon:'📣', label:'Who was notified', line1:'⚠️ Email + WhatsApp + Slack alerted.', line2:'High-priority alert sent to the team.', color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'❌', label:'Final result', line1:'Record is gone — no longer in database.', line2:'Restore from backup if needed.', color:'#f43f5e18',border:'#f43f5e'},
     ];
   }
-
-  /* ── Layout: single vertical column, wide boxes ── */
   const BOX_W=580, BOX_H=62, GAP_Y=16, START_X=40, HEADER_H=70;
   const SVG_W=660;
   const SVG_H=HEADER_H + steps.length*(BOX_H+GAP_Y) + 50;
-
   let svg=`<svg width="${SVG_W}" viewBox="0 0 ${SVG_W} ${SVG_H}" xmlns="http://www.w3.org/2000/svg" style="font-family:JetBrains Mono,monospace;max-width:100%">`;
   svg+=`<defs><marker id="arrd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M2 1L8 5L2 9" fill="none" stroke="#2a3a55" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>`;
-
-  /* Header banner */
   const LABEL={INSERT:'New Record Added',UPDATE:'Record Modified',DELETE:'Record Permanently Deleted',SOFT_DELETE:'Record Hidden (Soft Delete)',RESTORE:'Record Restored'};
   svg+=`<rect x="0" y="0" width="${SVG_W}" height="${HEADER_H}" rx="0" fill="${c}18"/>`;
   svg+=`<rect x="0" y="${HEADER_H-2}" width="${SVG_W}" height="2" fill="${c}44"/>`;
   svg+=`<text x="30" y="28" fill="${c}" font-size="15" font-weight="700">${LABEL[e.event]||e.event}</text>`;
   svg+=`<text x="30" y="46" fill="#7a94b8" font-size="11">Database: ${db}   |   Table: ${tbl}   |   Time: ${e.time}   |   Event #${e.id}</text>`;
   svg+=`<text x="30" y="62" fill="#4a5a75" font-size="10">Click any step for detail — scroll down to see full record data</text>`;
-
-  /* Steps */
   steps.forEach((step,i)=>{
     const bx=START_X, by=HEADER_H+8+i*(BOX_H+GAP_Y);
     const bc=step.border||'#2a3a55';
     const mx=bx+BOX_W/2;
-
-    /* Box */
     svg+=`<rect x="${bx}" y="${by}" width="${BOX_W}" height="${BOX_H}" rx="8" fill="${step.color||'#0f162388'}" stroke="${bc}" stroke-width="1"/>`;
-
-    /* Step number circle */
     svg+=`<circle cx="${bx+20}" cy="${by+BOX_H/2}" r="12" fill="${bc}33" stroke="${bc}" stroke-width="1"/>`;
     svg+=`<text x="${bx+20}" y="${by+BOX_H/2+1}" text-anchor="middle" dominant-baseline="middle" fill="${bc}" font-size="10" font-weight="700">${i+1}</text>`;
-
-    /* Icon */
     svg+=`<text x="${bx+44}" y="${by+BOX_H/2-6}" dominant-baseline="middle" font-size="16">${step.icon}</text>`;
-
-    /* Step label (title) */
     svg+=`<text x="${bx+68}" y="${by+20}" fill="#ffffff" font-size="11" font-weight="700">${step.label}</text>`;
-
-    /* Line 1 */
     svg+=`<text x="${bx+68}" y="${by+36}" fill="#c0cfe8" font-size="10">${step.line1}</text>`;
-
-    /* Line 2 */
     svg+=`<text x="${bx+68}" y="${by+50}" fill="#4a5a75" font-size="9">${step.line2}</text>`;
-
-    /* Connector arrow to next */
     if(i<steps.length-1){
       const ay=by+BOX_H+2, ay2=by+BOX_H+GAP_Y-2;
       svg+=`<line x1="${mx}" y1="${ay}" x2="${mx}" y2="${ay2}" stroke="#2a3a55" stroke-width="1.5" marker-end="url(#arrd)"/>`;
     }
   });
-
-  /* Footer */
   const footY=HEADER_H+8+steps.length*(BOX_H+GAP_Y)+4;
   svg+=`<text x="${SVG_W/2}" y="${footY+12}" text-anchor="middle" fill="#2a3a55" font-size="9">ADOPT Database Monitor v3  —  ${e.meta&&e.meta['Binlog File']?e.meta['Binlog File']:''}</text>`;
-
   svg+=`</svg>`;
   return svg;
 }
 
 async function openModal(id){
-  const resp=await fetch(`/api/event/${id}`);
+  const resp=await fetch('/api/event/'+id);
   if(!resp.ok)return;
   const e=await resp.json();
   document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
   let html='';
-
-  /* FIX 4 — Flowchart section at top of modal */
-  html+=`<div class="m-section">
-    <h4>📊 Event Flow Diagram — ${e.event.replace('_',' ')} Lifecycle</h4>
-    <div class="flow-wrap">${buildFlowchart(e)}</div>
-  </div>`;
-
+  html+=`<div class="m-section"><h4>📊 Event Flow Diagram — ${e.event.replace('_',' ')} Lifecycle</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
   if(e.meta){
     html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';
     for(const[k,v]of Object.entries(e.meta)){if(v)html+=`<div class="m-item"><div class="lbl">${k}</div><div class="val">${v}</div></div>`;}
