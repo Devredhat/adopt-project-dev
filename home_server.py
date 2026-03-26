@@ -3,6 +3,7 @@
 #  Fix: binlog file not found via proxy
 #  Fix: keep-alive no sleep
 #  Fix: all API paths rewritten correctly
+#  Fix: CSV export 404 via proxy — improved rewrite_html
 # ============================================================
 
 import threading, os, sys, time, re
@@ -436,6 +437,8 @@ def inspect_login_tables():
 
 def rewrite_html(content, tool_name):
     prefix = f"/tool/{tool_name}"
+
+    # Rewrite HTML attributes: src=, href=, action=
     for attr in ["src", "href", "action"]:
         for q in ['"', "'"]:
             content = re.sub(
@@ -443,11 +446,31 @@ def rewrite_html(content, tool_name):
                 f'{attr}={q}{prefix}/',
                 content
             )
+
+    # Rewrite fetch('/...')  fetch("/...")  fetch(`/...`)
     content = re.sub(r"fetch\('/(?!tool/)", f"fetch('{prefix}/", content)
     content = re.sub(r'fetch\("/(?!tool/)', f'fetch("{prefix}/', content)
     content = re.sub(r"fetch\(`/(?!tool/)", f"fetch(`{prefix}/", content)
+
+    # Rewrite window.open('/...')
     content = re.sub(r"window\.open\('/(?!tool/)", f"window.open('{prefix}/", content)
     content = re.sub(r'window\.open\("/(?!tool/)', f'window.open("{prefix}/', content)
+
+    # ── FIX: rewrite string variable assignments like:
+    #    const url = '/api/...'   or   const url = "/api/..."
+    #    This catches the exportCSV url variable and all similar patterns
+    content = re.sub(r"= '/(?!tool/)(?=api/)", f"= '{prefix}/", content)
+    content = re.sub(r'= "/(?!tool/)(?=api/)', f'= "{prefix}/', content)
+
+    # ── FIX: rewrite backtick template literal assignments like:
+    #    const url = `${something}/api/...`  (static segment after variable)
+    content = re.sub(r"` \+ '/(?!tool/)(?=api/)", f"` + '{prefix}/", content)
+    content = re.sub(r'` \+ "/(?!tool/)(?=api/)', f'` + "{prefix}/', content)
+
+    # ── FIX: rewrite ternary/conditional URL patterns like:
+    #    query ? `/api/export/csv?${query}` : `/api/export/csv`
+    content = re.sub(r"`/(?!tool/)(?=api/)", f"`{prefix}/", content)
+
     return content
 
 
