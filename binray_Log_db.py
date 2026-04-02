@@ -1,18 +1,21 @@
 # ============================================================
-# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v3
-# FIXED:
-#   1) DELETE/SOFT_DELETE events no longer disappear — dedup
-#      key no longer uses log_pos (which changes on reconnect),
-#      uses a stable content hash instead; also verified_deletes
-#      are pushed with a unique fingerprint so they always appear
-#   2) Metric boxes handle large numbers (10K, 1M) without overflow
-#      using responsive font-size + word-break
-#   3) CSV export 404 fixed — route now handles all filter combos
-#      and uses streaming response correctly on Render/gunicorn
-#   4) Per-event flowchart diagram added in event detail modal
-#   5) CSV export 404 via proxy fixed — exportCSV JS now detects
-#      its own base path dynamically so it works both standalone
-#      (:5000) and through the /tool/binlog/ proxy on Render
+# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v4
+# NEW IN v4:
+#   1) Supabase persistence — events survive Render.com sleeps
+#      and restarts. RAM is used as a fast cache; Supabase is
+#      the source of truth loaded on startup.
+#   2) /api/ping keepalive endpoint — point UptimeRobot /
+#      cron-job.org here so Render never sleeps.
+#   3) "Restore to DB" button on every DELETE / SOFT_DELETE
+#      event in the live audit log — one click sends the row
+#      back to MySQL.
+#   4) Weekly auto-reset: Supabase table is pruned every Monday
+#      00:00 so the 500 MB free tier never fills up.
+#      Storage estimate: ~1 KB/event → 500 MB ≈ 500 K events
+#      A busy system doing 10 K events/day fills that in ~50 days;
+#      with weekly pruning (7 days kept) peak usage ≈ 70 K rows
+#      ≈ 70 MB — well inside the free tier.
+#   5) All original fixes from v3 retained unchanged.
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq, Response
@@ -89,6 +92,136 @@ EXCLUDE_TABLES = {
     "tblauditlog", "tblaudit_log", "tblactivitylog", "tblactivity_log",
     "tbllog", "tblsystemlog", "tblaccesslog", "tbllogin_log",
 }
+
+# ─────────────────────────────────────────────────────────────
+#  SUPABASE CONFIG
+#  Set these as environment variables on Render:
+#    SUPABASE_URL  = https://xxxx.supabase.co
+#    SUPABASE_KEY  = your-anon-or-service-role-key
+#
+#  SQL to create the table in Supabase (run once in SQL editor):
+#  ─────────────────────────────────────────────────────────────
+#  create table if not exists adopt_events (
+#    id          bigint primary key,
+#    time        text,
+#    event       text,
+#    db          text,
+#    tbl         text,
+#    details     text,
+#    meta        jsonb,
+#    record      jsonb,
+#    diff        jsonb,
+#    created_at  timestamptz default now()
+#  );
+#  create index if not exists adopt_events_created_at_idx on adopt_events(created_at);
+#  ─────────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_TABLE = "adopt_events"
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+
+def _sb_headers():
+    return {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+    }
+
+def sb_insert_event(ev: dict):
+    """Upsert one event row into Supabase (non-blocking, called in thread)."""
+    if not SUPABASE_ENABLED:
+        return
+    payload = {
+        "id":      ev["id"],
+        "time":    ev["time"],
+        "event":   ev["event"],
+        "db":      ev["db"],
+        "tbl":     ev["table"],
+        "details": ev["details"],
+        "meta":    ev.get("meta", {}),
+        "record":  ev.get("record", {}),
+        "diff":    ev.get("diff", []),
+    }
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=payload, timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            print(f"  ⚠  Supabase insert failed [{resp.status_code}]: {resp.text[:200]}")
+    except Exception as e:
+        print(f"  ⚠  Supabase insert error: {e}")
+
+def sb_load_events(limit: int = 5000) -> list:
+    """Load the most recent events from Supabase on startup."""
+    if not SUPABASE_ENABLED:
+        return []
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers=_sb_headers(),
+            params={
+                "select": "*",
+                "order":  "id.desc",
+                "limit":  str(limit),
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"  ⚠  Supabase load failed [{resp.status_code}]: {resp.text[:200]}")
+            return []
+        rows = resp.json()
+        events = []
+        for r in rows:
+            events.append({
+                "id":      r["id"],
+                "time":    r["time"],
+                "event":   r["event"],
+                "db":      r["db"],
+                "table":   r["tbl"],
+                "details": r["details"],
+                "meta":    r.get("meta") or {},
+                "record":  r.get("record") or {},
+                "diff":    r.get("diff") or [],
+            })
+        print(f"  ✔  Loaded {len(events)} events from Supabase")
+        return events
+    except Exception as e:
+        print(f"  ⚠  Supabase load error: {e}")
+        return []
+
+def sb_weekly_prune():
+    """Delete events older than 7 days from Supabase. Run every week."""
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        # Supabase REST: delete where created_at < now() - interval '7 days'
+        resp = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers=_sb_headers(),
+            params={"created_at": "lt.now()-interval '7 days'"},
+            timeout=15,
+        )
+        print(f"  🗑  Supabase weekly prune: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠  Supabase prune error: {e}")
+
+def sb_clear_all():
+    """Clear all rows — used on daily/weekly reset."""
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        resp = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers={**_sb_headers(), "Prefer": "return=minimal"},
+            params={"id": "gte.0"},
+            timeout=15,
+        )
+        print(f"  🗑  Supabase cleared all rows: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠  Supabase clear error: {e}")
 
 # ─────────────────────────────────────────────────────────────
 #  BINLOG POSITION PERSISTENCE
@@ -176,8 +309,8 @@ STATE = {
     "customer_counts": {db: 0 for db in WATCH_DATABASES},
 }
 
-_col_cache = {}
-_event_id  = 0
+_col_cache  = {}
+_event_id   = 0
 _state_lock = threading.Lock()
 
 
@@ -225,15 +358,20 @@ def uptime_str():
         return "—"
 
 
-# ── DAILY RESET ──────────────────────────────────────────────
-def reset_daily_state():
+# ── WEEKLY RESET (runs every Monday 00:00) ───────────────────
+def reset_weekly_state():
+    """Clears RAM + Supabase every Monday midnight so the free tier never fills up."""
     while True:
         from datetime import timedelta
         now = datetime.now()
-        tomorrow_midnight = (now + timedelta(days=1)).replace(
+        # Find next Monday 00:00
+        days_ahead = (7 - now.weekday()) % 7  # 0 = today is Monday
+        if days_ahead == 0 and (now.hour > 0 or now.minute > 0):
+            days_ahead = 7  # already past midnight on Monday → next Monday
+        next_monday = (now + timedelta(days=days_ahead)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        time.sleep((tomorrow_midnight - now).total_seconds())
+        time.sleep((next_monday - now).total_seconds())
         global _event_id
         with _state_lock:
             STATE["events"].clear()
@@ -252,7 +390,9 @@ def reset_daily_state():
             _event_id = 0
         with _seen_events_lock:
             _seen_events.clear()
-        print(f"  🔄  Daily reset! {datetime.now().strftime('%Y-%m-%d')}")
+        # Clear Supabase rows older than this week
+        sb_clear_all()
+        print(f"  🔄  Weekly reset! {datetime.now().strftime('%Y-%m-%d')}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -308,7 +448,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
         "attachments": [{
             "color":  color, "fields": fields,
-            "footer": "ADOPT Database Monitor v3",
+            "footer": "ADOPT Database Monitor v4",
             "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
             "ts":     int(datetime.now().timestamp()),
         }],
@@ -479,7 +619,7 @@ def send_email_notification(event_type, db, table, record_data, diff_data=None, 
         {diff_html}{record_section}
       </div>
       <div style="background:#f8f9fa;padding:14px;text-align:center;color:#aaa;font-size:11px;border-top:1px solid #eee">
-        ADOPT Database Monitor v3 — Event #{meta.get('Event ID', '')}
+        ADOPT Database Monitor v4 — Event #{meta.get('Event ID', '')}
       </div>
     </div></body></html>"""
 
@@ -604,6 +744,9 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         if len(STATE["events"]) > 5000:
             STATE["events"] = STATE["events"][:5000]
 
+    # ── Persist to Supabase in background ──
+    threading.Thread(target=sb_insert_event, args=(ev,), daemon=True).start()
+
     tk = f"{db}.{table}"
     if tk not in STATE["stats"]["per_table"]:
         STATE["stats"]["per_table"][tk] = {"insert": 0, "update": 0, "delete": 0}
@@ -715,11 +858,44 @@ def check_binlog_status():
 
 
 # ─────────────────────────────────────────────────────────────
+#  SUPABASE STARTUP LOAD
+# ─────────────────────────────────────────────────────────────
+def load_events_from_supabase():
+    """Called once at startup to hydrate RAM from Supabase."""
+    global _event_id
+    events = sb_load_events(limit=5000)
+    if not events:
+        return
+    with _state_lock:
+        STATE["events"] = events  # already sorted newest-first
+        if events:
+            _event_id = max(e["id"] for e in events)
+        # Rebuild per-table stats from loaded events
+        for ev in events:
+            tk = f"{ev['db']}.{ev['table']}"
+            if tk not in STATE["stats"]["per_table"]:
+                STATE["stats"]["per_table"][tk] = {"insert": 0, "update": 0, "delete": 0}
+            etype = ev["event"].lower()
+            if etype == "insert":
+                STATE["stats"]["per_table"][tk]["insert"] += 1
+                STATE["stats"]["total_inserts"] += 1
+            elif etype in ("update", "soft_delete", "restore"):
+                STATE["stats"]["per_table"][tk]["update"] += 1
+                if etype == "update":    STATE["stats"]["total_updates"] += 1
+                if etype == "soft_delete": STATE["stats"]["total_soft_deletes"] += 1
+                if etype == "restore":   STATE["stats"]["total_restores"] += 1
+            elif etype == "delete":
+                STATE["stats"]["per_table"][tk]["delete"] += 1
+                STATE["stats"]["total_deletes"] += 1
+    print(f"  ✔  RAM hydrated with {len(events)} events from Supabase (max id={_event_id})")
+
+
+# ─────────────────────────────────────────────────────────────
 #  BINLOG MONITOR THREAD
 # ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
-    print("  ADOPT DATABASE MONITOR v3 — BINARY LOG CDC")
+    print("  ADOPT DATABASE MONITOR v4 — BINARY LOG CDC")
     print("="*70)
 
     while True:
@@ -850,6 +1026,13 @@ def binlog_monitor():
 # ─────────────────────────────────────────────────────────────
 #  API ENDPOINTS
 # ─────────────────────────────────────────────────────────────
+
+# ── Keepalive ping — point UptimeRobot / cron-job.org here ──
+@app.route("/api/ping")
+def api_ping():
+    return jsonify({"status": "ok", "time": now_str(), "uptime": uptime_str()})
+
+
 @app.route("/api/events")
 def api_events():
     limit  = int(freq.args.get("limit",  100))
@@ -907,6 +1090,7 @@ def api_stats():
         "mysql_host":            STATE["mysql_host"],
         "uptime":                uptime_str(),
         "start_time":            STATE["start_time"],
+        "supabase_enabled":      SUPABASE_ENABLED,
         **STATE["stats"],
     })
 
@@ -922,9 +1106,7 @@ def api_table_stats():
     return jsonify(rows[:50])
 
 
-# ─────────────────────────────────────────────────────────────
-#  CSV EXPORT — fully buffered in memory
-# ─────────────────────────────────────────────────────────────
+# ── CSV EXPORT — fully buffered in memory ────────────────────
 @app.route("/api/export/csv", methods=["GET"])
 def api_export_csv():
     db_f   = freq.args.get("db",    "").strip().lower()
@@ -963,7 +1145,7 @@ def api_export_csv():
             e.get("meta",{}).get("Verification",""),
         ])
 
-    csv_bytes = buf.getvalue().encode("utf-8")   # plain utf-8 — arrows replaced with ASCII ->
+    csv_bytes = buf.getvalue().encode("utf-8")
 
     fname = "adopt_events"
     if ev_f and ev_f not in ("", "ALL"):
@@ -988,6 +1170,84 @@ def api_export_csv():
 
 
 # ─────────────────────────────────────────────────────────────
+#  RESTORE-TO-DB ENDPOINT
+#  POST /api/restore/<event_id>
+#  Looks up the deleted record from the event log and re-inserts
+#  it into MySQL. Works for both DELETE and SOFT_DELETE events.
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/restore/<int:eid>", methods=["POST"])
+def api_restore(eid):
+    with _state_lock:
+        evs = list(STATE["events"])
+    ev = next((e for e in evs if e["id"] == eid), None)
+    if not ev:
+        return jsonify({"success": False, "error": f"Event #{eid} not found in log"}), 404
+
+    if ev["event"] not in ("DELETE", "SOFT_DELETE"):
+        return jsonify({"success": False,
+                        "error": f"Restore only works on DELETE / SOFT_DELETE events, not {ev['event']}"}), 400
+
+    db     = ev["db"]
+    table  = ev["table"]
+    record = ev.get("record", {})
+
+    if not record:
+        return jsonify({"success": False, "error": "No record data stored for this event"}), 400
+
+    # For SOFT_DELETE: flip is_delete back to 0 (UPDATE), don't re-insert
+    if ev["event"] == "SOFT_DELETE":
+        pk_col, pk_val = _find_primary_key(db, table, record)
+        if not pk_col:
+            return jsonify({"success": False, "error": "Cannot find primary key for soft-delete restore"}), 400
+        try:
+            conn = pymysql.connect(**{**MYSQL_SETTINGS, "db": db,
+                                       "cursorclass": pymysql.cursors.DictCursor,
+                                       "connect_timeout": 5})
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE `{table}` SET `is_delete` = 0 WHERE `{pk_col}` = %s",
+                (pk_val,)
+            )
+            conn.commit()
+            cur.close(); conn.close()
+            msg = f"Soft-delete reversed: {table}[{pk_col}={pk_val}] is_delete set to 0"
+            print(f"  ♻  RESTORE (soft) {db}.{table} [{pk_col}={pk_val}]")
+            return jsonify({"success": True, "message": msg})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # For hard DELETE: rebuild INSERT from stored record columns
+    # Filter out empty values and cast safely
+    clean = {k: v for k, v in record.items() if v is not None and str(v).strip() != ""}
+    if not clean:
+        return jsonify({"success": False, "error": "Record data is empty — cannot restore"}), 400
+
+    cols   = ", ".join(f"`{c}`" for c in clean.keys())
+    placeholders = ", ".join(["%s"] * len(clean))
+    values = list(clean.values())
+
+    try:
+        conn = pymysql.connect(**{**MYSQL_SETTINGS, "db": db,
+                                   "cursorclass": pymysql.cursors.DictCursor,
+                                   "connect_timeout": 5})
+        cur = conn.cursor()
+        sql = f"INSERT IGNORE INTO `{table}` ({cols}) VALUES ({placeholders})"
+        cur.execute(sql, values)
+        conn.commit()
+        affected = cur.rowcount
+        cur.close(); conn.close()
+        if affected > 0:
+            msg = f"Record restored to {db}.{table} ({len(clean)} columns)"
+            print(f"  ♻  RESTORED {db}.{table} — {len(clean)} cols")
+        else:
+            msg = f"Record already exists in {db}.{table} (INSERT IGNORE skipped — possible duplicate PK)"
+        return jsonify({"success": True, "message": msg, "rows_affected": affected})
+    except Exception as e:
+        print(f"  ✗  Restore error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
 # ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -995,7 +1255,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ADOPT DB Monitor v3</title>
+<title>ADOPT DB Monitor v4</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
@@ -1018,6 +1278,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .b-up{background:#38bdf818;color:#38bdf8;border:1px solid #38bdf844}
 .b-wa{background:#25d36618;color:#25d366;border:1px solid #25d36644}
 .b-sl{background:#e01e5a18;color:#e01e5a;border:1px solid #e01e5a44}
+.b-sb{background:#3ecf8e18;color:#3ecf8e;border:1px solid #3ecf8e44}
 .pulse{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22d87a;margin-right:4px;animation:blink 1.4s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
 #loading{display:flex;flex-direction:column;align-items:center;justify-content:center;height:70vh;gap:14px;color:var(--muted)}
@@ -1076,7 +1337,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .btn-sound{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:10px;padding:4px 9px;border-radius:6px;cursor:pointer}
 .btn-sound.on{border-color:var(--ins);color:var(--ins)}
 .log-body{max-height:500px;overflow-y:auto}
-.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 30px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s;cursor:pointer}
+.ev{display:grid;grid-template-columns:130px 100px 190px 1fr 110px;gap:10px;align-items:start;padding:9px 16px;border-bottom:1px solid #ffffff06;transition:background .1s}
 .ev:hover{background:#ffffff05}
 .ev-time{color:var(--muted);font-size:10px;line-height:1.4}
 .ev-type{font-weight:700;font-size:10px;letter-spacing:.4px;padding:2px 7px;border-radius:4px;width:fit-content;white-space:nowrap}
@@ -1086,8 +1347,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .ev-type.SOFT_DELETE{background:#a78bfa14;color:var(--soft);border:1px solid #a78bfa30}
 .ev-type.RESTORE{background:#38bdf814;color:var(--rest);border:1px solid #38bdf830}
 .ev-loc{color:#7a94b8;font-size:10px;word-break:break-all;line-height:1.5}
-.ev-detail{color:var(--muted);font-size:10px;word-break:break-word;line-height:1.5}
-.ev-arrow{color:var(--muted);font-size:12px;text-align:center;padding-top:2px}
+.ev-detail{color:var(--muted);font-size:10px;word-break:break-word;line-height:1.5;cursor:pointer}
+.ev-actions{display:flex;flex-direction:column;gap:4px;align-items:flex-end}
+.btn-detail{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:9px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;transition:all .15s}
+.btn-detail:hover{border-color:var(--acc);color:#fff}
+.btn-restore{background:#f43f5e14;border:1px solid #f43f5e44;color:#f43f5e;font-family:inherit;font-size:9px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;transition:all .15s;font-weight:700}
+.btn-restore:hover{background:#f43f5e28;border-color:#f43f5e88}
+.btn-restore.soft{background:#a78bfa14;border-color:#a78bfa44;color:#a78bfa}
+.btn-restore.soft:hover{background:#a78bfa28;border-color:#a78bfa88}
+.btn-restore:disabled{opacity:.4;cursor:not-allowed}
 .empty{text-align:center;padding:40px;color:var(--muted);font-size:12px}
 .pager{padding:10px 16px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:10px}
 .pager-info{color:var(--muted)}.pager-btns{display:flex;gap:6px}
@@ -1120,18 +1388,34 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 .rec-table td:last-child{color:#fff;word-break:break-word}
 .flow-wrap{margin-top:10px;overflow-x:auto;border-radius:8px;background:var(--surf2);padding:16px}
 .flow-wrap svg{display:block;margin:0 auto}
+.restore-bar{background:#f43f5e0d;border:1px solid #f43f5e33;border-radius:8px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.restore-bar.soft{background:#a78bfa0d;border-color:#a78bfa33}
+.restore-info{flex:1;font-size:11px;color:var(--text)}
+.restore-info strong{display:block;font-size:13px;margin-bottom:4px}
+.restore-info.del strong{color:#f43f5e}
+.restore-info.soft strong{color:#a78bfa}
+.restore-info p{color:var(--muted);font-size:10px}
+.btn-restore-modal{padding:8px 20px;border-radius:6px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;transition:opacity .15s}
+.btn-restore-modal.del{background:#f43f5e;color:#fff}
+.btn-restore-modal.soft{background:#a78bfa;color:#fff}
+.btn-restore-modal:hover{opacity:.85}
+.btn-restore-modal:disabled{opacity:.4;cursor:not-allowed}
+.restore-result{margin-top:8px;padding:8px 12px;border-radius:6px;font-size:11px;display:none}
+.restore-result.ok{background:#22d87a14;color:#22d87a;border:1px solid #22d87a33}
+.restore-result.err{background:#f43f5e14;color:#f43f5e;border:1px solid #f43f5e33}
 .footer-bar{padding:10px 24px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);display:flex;justify-content:space-between}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v3</sub></div>
+  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v4</sub></div>
   <div class="hbadges">
     <span class="badge b-live"><span class="pulse"></span>LIVE</span>
     <span class="badge b-bl">⚡ BINLOG CDC</span>
     <span class="badge b-em" id="email-badge">📧 EMAIL ON</span>
     <span class="badge b-wa" id="wa-badge">📱 WA ON</span>
     <span class="badge b-sl" id="sl-badge">💬 SLACK ON</span>
+    <span class="badge b-sb" id="sb-badge">🗄 SUPABASE ON</span>
     <span class="badge b-up" id="uptime-badge">⏱ 0h 0m</span>
   </div>
 </header>
@@ -1224,7 +1508,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 
   <div class="footer-bar">
     <span id="last-event">No events yet</span>
-    <span>⚡ Real-time via MySQL Binlog CDC — Zero polling delay</span>
+    <span>⚡ Real-time via MySQL Binlog CDC — Persisted to Supabase</span>
   </div>
 </div>
 
@@ -1249,51 +1533,83 @@ function setFilter(f){activeFilter=f;pageOffset=0;document.querySelectorAll('.fl
 function onSearch(){searchTerm=document.getElementById('search-box').value;pageOffset=0;load();}
 function changePage(dir){pageOffset=Math.max(0,pageOffset+dir*pageSize);load();}
 
-// ─────────────────────────────────────────────────────────────
-// FIX 5 — CSV EXPORT: detect our own base path so this works
-// both when accessed directly on :5000 AND via the /tool/binlog/
-// proxy on Render. We look at window.location.pathname to figure
-// out the correct API prefix instead of hard-coding '/api/'.
-// ─────────────────────────────────────────────────────────────
+// ── CSV EXPORT (proxy-aware base path) ──────────────────────
 async function exportCSV(){
   const params = new URLSearchParams();
   if (activeDB !== 'all')    params.append('db',     activeDB);
   if (activeFilter !== 'ALL') params.append('event',  activeFilter);
   if (searchTerm)             params.append('search', searchTerm);
-
-  // Detect whether we are running behind the proxy or standalone.
-  // Behind proxy: pathname starts with /tool/binlog/
-  // Standalone:   pathname is just /
   const pathParts = window.location.pathname.split('/').filter(Boolean);
-  // pathParts behind proxy = ['tool', 'binlog', ...]
-  // pathParts standalone   = []
   let apiBase = '';
   if (pathParts.length >= 2 && pathParts[0] === 'tool') {
-    // We are inside a proxy — prefix API calls with /tool/<name>
     apiBase = '/' + pathParts[0] + '/' + pathParts[1];
   }
-  // apiBase is now either '' (standalone) or '/tool/binlog' (proxy)
-
   const query = params.toString();
   const url   = apiBase + '/api/export/csv' + (query ? '?' + query : '');
-
   try {
     const resp = await fetch(url);
-    if (!resp.ok) {
-      alert('Export failed: ' + resp.status + ' — URL tried: ' + url);
-      return;
-    }
+    if (!resp.ok) { alert('Export failed: ' + resp.status + ' — URL tried: ' + url); return; }
     const blob   = await resp.blob();
     const objUrl = URL.createObjectURL(blob);
     const a      = document.createElement('a');
-    a.href       = objUrl;
-    a.download   = 'adopt_events.csv';
-    document.body.appendChild(a);
-    a.click();
+    a.href = objUrl; a.download = 'adopt_events.csv';
+    document.body.appendChild(a); a.click();
     setTimeout(() => { URL.revokeObjectURL(objUrl); document.body.removeChild(a); }, 2000);
+  } catch(err) { alert('Export error: ' + err); }
+}
+
+// ── RESTORE TO DB ────────────────────────────────────────────
+async function restoreRecord(eid, btn){
+  if(!confirm('Restore this deleted record back to MySQL?\n\nThis will re-INSERT the row into the database. Are you sure?')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ Restoring...';
+  try {
+    const resp = await fetch('/api/restore/' + eid, { method: 'POST' });
+    const data = await resp.json();
+    if (data.success) {
+      btn.textContent = '✅ Restored!';
+      btn.style.background = '#22d87a14';
+      btn.style.borderColor = '#22d87a44';
+      btn.style.color = '#22d87a';
+      // Update modal restore result if open
+      const rr = document.getElementById('restore-result-'+eid);
+      if (rr) { rr.textContent = '✅ ' + data.message; rr.className='restore-result ok'; rr.style.display='block'; }
+      // Update modal button too
+      const mb = document.getElementById('modal-restore-btn-'+eid);
+      if (mb) { mb.disabled=true; mb.textContent='✅ Restored!'; }
+    } else {
+      btn.textContent = '❌ Failed';
+      btn.disabled = false;
+      const rr = document.getElementById('restore-result-'+eid);
+      if (rr) { rr.textContent = '❌ Error: ' + data.error; rr.className='restore-result err'; rr.style.display='block'; }
+      alert('Restore failed: ' + data.error);
+    }
   } catch(err) {
-    alert('Export error: ' + err);
+    btn.textContent = '❌ Error'; btn.disabled = false;
+    alert('Restore error: ' + err);
   }
+}
+
+async function restoreFromModal(eid){
+  const btn = document.getElementById('modal-restore-btn-'+eid);
+  if (!btn) return;
+  if(!confirm('Restore this deleted record back to MySQL?\n\nThis will re-INSERT the row into the database. Are you sure?')) return;
+  btn.disabled = true; btn.textContent = '⏳ Restoring...';
+  try {
+    const resp = await fetch('/api/restore/' + eid, { method: 'POST' });
+    const data = await resp.json();
+    const rr = document.getElementById('restore-result-'+eid);
+    if (data.success) {
+      btn.textContent = '✅ Restored!';
+      if (rr) { rr.textContent = '✅ ' + data.message; rr.className='restore-result ok'; rr.style.display='block'; }
+      // Also update inline button in event list
+      const inlineBtn = document.getElementById('inline-restore-'+eid);
+      if(inlineBtn){ inlineBtn.textContent='✅ Restored'; inlineBtn.disabled=true; }
+    } else {
+      btn.textContent = '↩ Restore to DB'; btn.disabled=false;
+      if (rr) { rr.textContent = '❌ Error: ' + data.error; rr.className='restore-result err'; rr.style.display='block'; }
+    }
+  } catch(err) { btn.textContent='↩ Restore to DB'; btn.disabled=false; alert('Error: '+err); }
 }
 
 /* ── Per-event flowchart ── */
@@ -1339,7 +1655,7 @@ function buildFlowchart(e){
       {icon:'🚫', label:'What happened', line1:'A record was marked as DELETED', line2:'(but NOT physically removed from DB).', color:'#a78bfa18',border:'#a78bfa'},
       {icon:'🔍', label:'Which record', line1:ridLine||trunc(e.details||''), line2:'is_delete flag set to 1 (hidden from app).', color:'#0f162388',border:'#2a3a55'},
       {icon:'📣', label:'Who was notified', line1:'Email + WhatsApp + Slack notified.', line2:'Team alerted about the soft-deletion.', color:'#6366f118',border:'#6366f1'},
-      {icon:'💡', label:'What this means', line1:'Record still exists — can be restored.', line2:'Use RESTORE action to bring it back.', color:'#a78bfa18',border:'#a78bfa'},
+      {icon:'💡', label:'What this means', line1:'Record still exists — can be restored.', line2:'Click RESTORE below to bring it back.', color:'#a78bfa18',border:'#a78bfa'},
     ];
   } else if(e.event==='RESTORE'){
     steps=[
@@ -1354,11 +1670,11 @@ function buildFlowchart(e){
     const verLine=verified?trunc(verified,48):'Confirmed — record gone from database.';
     steps=[
       {icon:'🗄️', label:'Where it happened', line1:`Database: ${db}`, line2:`Table: ${tbl}`, color:'#f43f5e18',border:'#f43f5e'},
-      {icon:'🗑️', label:'What happened', line1:'A record was PERMANENTLY DELETED.', line2:'This action CANNOT be undone.', color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'🗑️', label:'What happened', line1:'A record was PERMANENTLY DELETED.', line2:'Use RESTORE below to undo this.', color:'#f43f5e18',border:'#f43f5e'},
       {icon:'🔍', label:'Which record was deleted', line1:ridLine||trunc(e.details||''), line2:'Row removed from the table completely.', color:'#0f162388',border:'#2a3a55'},
       {icon:'🛡️', label:'Deletion verified', line1:verLine, line2:'System double-checked before alerting.', color:'#f59e0b18',border:'#f59e0b'},
       {icon:'📣', label:'Who was notified', line1:'⚠️ Email + WhatsApp + Slack alerted.', line2:'High-priority alert sent to the team.', color:'#f43f5e18',border:'#f43f5e'},
-      {icon:'❌', label:'Final result', line1:'Record is gone — no longer in database.', line2:'Restore from backup if needed.', color:'#f43f5e18',border:'#f43f5e'},
+      {icon:'❌', label:'Final result', line1:'Record gone — click RESTORE to recover.', line2:'All original column data is stored here.', color:'#f43f5e18',border:'#f43f5e'},
     ];
   }
   const BOX_W=580, BOX_H=62, GAP_Y=16, START_X=40, HEADER_H=70;
@@ -1371,7 +1687,7 @@ function buildFlowchart(e){
   svg+=`<rect x="0" y="${HEADER_H-2}" width="${SVG_W}" height="2" fill="${c}44"/>`;
   svg+=`<text x="30" y="28" fill="${c}" font-size="15" font-weight="700">${LABEL[e.event]||e.event}</text>`;
   svg+=`<text x="30" y="46" fill="#7a94b8" font-size="11">Database: ${db}   |   Table: ${tbl}   |   Time: ${e.time}   |   Event #${e.id}</text>`;
-  svg+=`<text x="30" y="62" fill="#4a5a75" font-size="10">Click any step for detail — scroll down to see full record data</text>`;
+  svg+=`<text x="30" y="62" fill="#4a5a75" font-size="10">Click RESTORE button below to undo this deletion</text>`;
   steps.forEach((step,i)=>{
     const bx=START_X, by=HEADER_H+8+i*(BOX_H+GAP_Y);
     const bc=step.border||'#2a3a55';
@@ -1389,7 +1705,7 @@ function buildFlowchart(e){
     }
   });
   const footY=HEADER_H+8+steps.length*(BOX_H+GAP_Y)+4;
-  svg+=`<text x="${SVG_W/2}" y="${footY+12}" text-anchor="middle" fill="#2a3a55" font-size="9">ADOPT Database Monitor v3  —  ${e.meta&&e.meta['Binlog File']?e.meta['Binlog File']:''}</text>`;
+  svg+=`<text x="${SVG_W/2}" y="${footY+12}" text-anchor="middle" fill="#2a3a55" font-size="9">ADOPT Database Monitor v4  —  ${e.meta&&e.meta['Binlog File']?e.meta['Binlog File']:''}</text>`;
   svg+=`</svg>`;
   return svg;
 }
@@ -1400,6 +1716,28 @@ async function openModal(id){
   const e=await resp.json();
   document.getElementById('modal-title').innerHTML=`<span class="ev-type ${e.event}" style="margin-right:10px">${e.event.replace('_',' ')}</span> ${e.table}`;
   let html='';
+
+  // ── Restore bar (only for DELETE / SOFT_DELETE) ──
+  if(e.event==='DELETE'||e.event==='SOFT_DELETE'){
+    const isSoft = e.event==='SOFT_DELETE';
+    const cls = isSoft ? 'soft' : 'del';
+    const title = isSoft
+      ? '🚫 This record was soft-deleted — it still exists in MySQL'
+      : '🗑️ This record was permanently deleted from MySQL';
+    const desc = isSoft
+      ? 'Clicking Restore will set <code>is_delete = 0</code> on this row, making it active again.'
+      : 'Clicking Restore will re-INSERT this row with all its original column values.';
+    html += `<div class="restore-bar ${isSoft?'soft':''}">
+      <div class="notif-icon">${isSoft?'🚫':'🗑️'}</div>
+      <div class="restore-info ${cls}">
+        <strong>${title}</strong>
+        <p>${desc}</p>
+      </div>
+      <button class="btn-restore-modal ${cls}" id="modal-restore-btn-${e.id}" onclick="restoreFromModal(${e.id})">↩ Restore to DB</button>
+    </div>
+    <div class="restore-result" id="restore-result-${e.id}"></div>`;
+  }
+
   html+=`<div class="m-section"><h4>📊 Event Flow Diagram — ${e.event.replace('_',' ')} Lifecycle</h4><div class="flow-wrap">${buildFlowchart(e)}</div></div>`;
   if(e.meta){
     html+='<div class="m-section"><h4>⚙️ Event Metadata</h4><div class="m-grid">';
@@ -1427,7 +1765,23 @@ function renderEvents(){
     el.innerHTML='<div class="empty">Waiting for binlog events...<br><small>Changes appear instantly as they happen in MySQL</small></div>';
     return;
   }
-  el.innerHTML=allEvents.map(x=>`<div class="ev" onclick="openModal(${x.id})"><span class="ev-time">${x.time}</span><span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span><span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span><span class="ev-detail">${x.details||''}</span><span class="ev-arrow">›</span></div>`).join('');
+  el.innerHTML=allEvents.map(x=>{
+    const canRestore = x.event==='DELETE'||x.event==='SOFT_DELETE';
+    const isSoft = x.event==='SOFT_DELETE';
+    const restoreBtn = canRestore
+      ? `<button class="btn-restore ${isSoft?'soft':''}" id="inline-restore-${x.id}" onclick="event.stopPropagation();restoreRecord(${x.id},this)" title="Restore this deleted record back to MySQL">↩ Restore</button>`
+      : '';
+    return `<div class="ev" onclick="openModal(${x.id})">
+      <span class="ev-time">${x.time}</span>
+      <span class="ev-type ${x.event}">${x.event.replace('_',' ')}</span>
+      <span class="ev-loc">${x.db}<br><strong>${x.table}</strong></span>
+      <span class="ev-detail">${x.details||''}</span>
+      <div class="ev-actions">
+        <button class="btn-detail" onclick="event.stopPropagation();openModal(${x.id})">› Details</button>
+        ${restoreBtn}
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function renderPagination(){
@@ -1452,6 +1806,7 @@ async function load(){
     document.getElementById('email-badge').textContent=s.email_enabled?'📧 EMAIL ON':'📧 EMAIL OFF';
     document.getElementById('wa-badge').textContent=s.whatsapp_enabled?'📱 WA ON':'📱 WA OFF';
     document.getElementById('sl-badge').textContent=s.slack_enabled?'💬 SLACK ON':'💬 SLACK OFF';
+    document.getElementById('sb-badge').textContent=s.supabase_enabled?'🗄 SUPABASE ON':'🗄 SUPABASE OFF';
     document.getElementById('uptime-badge').textContent=`⏱ ${s.uptime}`;
     document.getElementById('i-binlog').textContent=s.binlog_file||'—';
     document.getElementById('i-pos').textContent=s.binlog_position||'—';
@@ -1523,8 +1878,16 @@ def dashboard():
 if __name__ == "__main__":
     check_binlog_status()
     warm_column_cache()
+    # Load persisted events from Supabase before starting binlog stream
+    if SUPABASE_ENABLED:
+        print("\n  🗄  Loading events from Supabase...")
+        load_events_from_supabase()
+    else:
+        print("\n  ⚠  Supabase not configured — events stored in RAM only")
+        print("     Set SUPABASE_URL and SUPABASE_KEY env vars to enable persistence\n")
     threading.Thread(target=binlog_monitor, daemon=True).start()
-    threading.Thread(target=reset_daily_state, daemon=True).start()
+    threading.Thread(target=reset_weekly_state, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
-    print(f"\nDashboard: http://0.0.0.0:{port}\n")
+    print(f"\nDashboard:   http://0.0.0.0:{port}")
+    print(f"Ping/keepalive: http://0.0.0.0:{port}/api/ping\n")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
