@@ -1,30 +1,25 @@
 # ============================================================
-# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v5
-# KEY FIX in v5:
-#   ROOT CAUSE: On Render.com every sleep/restart wipes /tmp
-#   so the saved binlog position file is gone → app falls back
-#   to SHOW MASTER STATUS which should give the CURRENT live
-#   position.  BUT pymysqlreplication, when no log_file/log_pos
-#   are given at ALL, silently starts from the VERY FIRST
-#   available binlog (000001 @ 4).  The SHOW MASTER STATUS
-#   branch was only running when the /tmp file was missing, but
-#   a race condition meant stream_kwargs sometimes had no
-#   log_file/log_pos keys at all.
+# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v6
+# KEY FIX in v6 (on top of v5):
+#   ROOT CAUSE of freeze after 30 min:
+#   save_binlog_position() was spawning a NEW THREAD on every
+#   single binlog event to write to Supabase. A busy MySQL DB
+#   fires thousands of events/minute → thousands of threads →
+#   Supabase rate-limit hits → threads pile up → app freezes.
 #
-#   FIX — 3-layer position safety:
-#     Layer 1 (primary)  : Supabase kv table  ← survives restarts
-#     Layer 2 (fast cache): /tmp json file     ← wiped on sleep
-#     Layer 3 (live now) : SHOW MASTER STATUS  ← true first run
-#   All three layers are tried in order. If ALL fail we still
-#   call SHOW MASTER STATUS and HARD-ASSERT the result before
-#   creating the stream. We NEVER create a stream without an
-#   explicit log_file + log_pos.
+#   FIX 1 — Position flush: save_binlog_position() now only
+#   writes to /tmp (synchronous, instant). A single dedicated
+#   _position_flush_worker thread wakes every 30 s and sends
+#   the latest position to Supabase in ONE HTTP call.
 #
-#   ALSO FIXED:
-#   • Supabase now has a second table `adopt_binlog_pos` that
-#     stores the last-seen position so it survives Render sleeps
-#   • Position is saved to both /tmp AND Supabase on every event
-#   • No other UI / logic changes from v4
+#   FIX 2 — Event writes: sb_insert_event() now pushes events
+#   into a bounded queue (max 10 000). A single dedicated
+#   _sb_event_worker thread drains the queue one-by-one.
+#   No matter how many events fire per second, there is always
+#   exactly ONE Supabase writer thread — no thread flood.
+#
+#   All v5 fixes (3-layer position, restore button, keepalive
+#   ping, weekly reset) are retained unchanged.
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq, Response
@@ -190,31 +185,58 @@ def sb_load_position():
     return None, None
 
 # ── Supabase: events ─────────────────────────────────────────
+
+# ── Supabase event write queue ────────────────────────────────
+# Instead of spawning a thread per event (causes thread flood on
+# busy DBs), we push events into a queue and drain it in one
+# dedicated worker thread with a small batch window.
+import queue as _queue
+_sb_event_queue: _queue.Queue = _queue.Queue(maxsize=10_000)
+
+def _sb_event_worker():
+    """Drains the Supabase insert queue — one worker, no flood."""
+    while True:
+        ev = _sb_event_queue.get()
+        if not SUPABASE_ENABLED:
+            _sb_event_queue.task_done()
+            continue
+        payload = {
+            "id":      ev["id"],
+            "time":    ev["time"],
+            "event":   ev["event"],
+            "db":      ev["db"],
+            "tbl":     ev["table"],
+            "details": ev["details"],
+            "meta":    ev.get("meta", {}),
+            "record":  ev.get("record", {}),
+            "diff":    ev.get("diff", []),
+        }
+        try:
+            resp = requests.post(
+                f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                headers=_sb_headers("resolution=merge-duplicates,return=minimal"),
+                json=payload, timeout=10,
+            )
+            if resp.status_code not in (200, 201):
+                print(f"  ⚠  Supabase insert failed [{resp.status_code}]: {resp.text[:200]}")
+        except Exception as e:
+            print(f"  ⚠  Supabase insert error: {e}")
+        finally:
+            _sb_event_queue.task_done()
+
 def sb_insert_event(ev: dict):
-    """Upsert one event row into Supabase (non-blocking, called in thread)."""
+    """Enqueue event for Supabase insert (non-blocking)."""
     if not SUPABASE_ENABLED:
         return
-    payload = {
-        "id":      ev["id"],
-        "time":    ev["time"],
-        "event":   ev["event"],
-        "db":      ev["db"],
-        "tbl":     ev["table"],
-        "details": ev["details"],
-        "meta":    ev.get("meta", {}),
-        "record":  ev.get("record", {}),
-        "diff":    ev.get("diff", []),
-    }
     try:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
-            headers=_sb_headers("resolution=merge-duplicates,return=minimal"),
-            json=payload, timeout=10,
-        )
-        if resp.status_code not in (200, 201):
-            print(f"  ⚠  Supabase insert failed [{resp.status_code}]: {resp.text[:200]}")
-    except Exception as e:
-        print(f"  ⚠  Supabase insert error: {e}")
+        _sb_event_queue.put_nowait(ev)
+    except _queue.Full:
+        print("  ⚠  Supabase queue full — dropping oldest event")
+        try:
+            _sb_event_queue.get_nowait()
+            _sb_event_queue.put_nowait(ev)
+        except Exception:
+            pass
 
 def sb_load_events(limit: int = 5000) -> list:
     """Load the most recent events from Supabase on startup."""
@@ -287,16 +309,47 @@ def sb_clear_all():
 # ─────────────────────────────────────────────────────────────
 POSITION_FILE = "/tmp/adopt_binlog_position.json"
 
+
+# ── Pending position for the periodic Supabase flush ─────────
+_pending_pos_lock = threading.Lock()
+_pending_pos = {"log_file": None, "log_pos": None}
+
 def save_binlog_position(log_file: str, log_pos: int):
-    """Save to BOTH /tmp and Supabase."""
-    # Layer 2: local file (fast)
+    """
+    Save position to /tmp immediately (fast, local).
+    Mark as pending for Supabase — the dedicated flush thread
+    will actually write to Supabase every 30 s.
+    DO NOT spawn a thread here — this is called on EVERY binlog
+    event and spawning thousands of threads caused the freeze.
+    """
+    # Layer 2: /tmp — always write synchronously (trivially fast)
     try:
         with open(POSITION_FILE, "w") as f:
             json.dump({"log_file": log_file, "log_pos": log_pos}, f)
     except Exception as e:
         print(f"  ⚠  Could not save /tmp binlog position: {e}")
-    # Layer 1: Supabase (durable) — do in background to not slow binlog loop
-    threading.Thread(target=sb_save_position, args=(log_file, log_pos), daemon=True).start()
+    # Layer 1: just mark as pending — flushed by _position_flush_worker
+    with _pending_pos_lock:
+        _pending_pos["log_file"] = log_file
+        _pending_pos["log_pos"]  = log_pos
+
+
+def _position_flush_worker():
+    """
+    Dedicated thread: flushes the latest binlog position to Supabase
+    every 30 seconds.  Only ONE HTTP call per 30 s regardless of
+    how many binlog events fire — eliminates the thread flood.
+    """
+    last_flushed_pos = None
+    while True:
+        time.sleep(30)
+        with _pending_pos_lock:
+            lf = _pending_pos.get("log_file")
+            lp = _pending_pos.get("log_pos")
+        if lf and lp and lp != last_flushed_pos:
+            sb_save_position(lf, lp)
+            last_flushed_pos = lp
+            print(f"  💾  Position flushed to Supabase: {lf} @ {lp}")
 
 def load_binlog_position():
     """
@@ -548,7 +601,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
         "attachments": [{
             "color":  color, "fields": fields,
-            "footer": "ADOPT Database Monitor v5",
+            "footer": "ADOPT Database Monitor v6",
             "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
             "ts":     int(datetime.now().timestamp()),
         }],
@@ -835,7 +888,8 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         if len(STATE["events"]) > 5000:
             STATE["events"] = STATE["events"][:5000]
 
-    threading.Thread(target=sb_insert_event, args=(ev,), daemon=True).start()
+    # ── Enqueue for Supabase (single worker thread, no flood) ──
+    sb_insert_event(ev)
 
     tk = f"{db}.{table}"
     if tk not in STATE["stats"]["per_table"]:
@@ -983,7 +1037,7 @@ def load_events_from_supabase():
 # ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
-    print("  ADOPT DATABASE MONITOR v5 — BINARY LOG CDC")
+    print("  ADOPT DATABASE MONITOR v6 — BINARY LOG CDC")
     print("="*70)
 
     while True:
@@ -1331,7 +1385,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ADOPT DB Monitor v5</title>
+<title>ADOPT DB Monitor v6</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
@@ -1484,7 +1538,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 </head>
 <body>
 <header>
-  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v5</sub></div>
+  <div class="logo">ADOPT<span>.</span>MONITOR<sub>v6</sub></div>
   <div class="hbadges">
     <span class="badge b-live"><span class="pulse"></span>LIVE</span>
     <span class="badge b-bl">⚡ BINLOG CDC</span>
@@ -1584,7 +1638,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 
   <div class="footer-bar">
     <span id="last-event">No events yet</span>
-    <span>⚡ Real-time via MySQL Binlog CDC — Persisted to Supabase — v5</span>
+    <span>⚡ Real-time via MySQL Binlog CDC — Persisted to Supabase — v6</span>
   </div>
 </div>
 
@@ -1935,6 +1989,9 @@ if __name__ == "__main__":
         print("     Set SUPABASE_URL + SUPABASE_KEY env vars to enable\n")
     threading.Thread(target=binlog_monitor, daemon=True).start()
     threading.Thread(target=reset_weekly_state, daemon=True).start()
+    # Supabase workers — single queue consumer + periodic position flush
+    threading.Thread(target=_sb_event_worker, daemon=True).start()
+    threading.Thread(target=_position_flush_worker, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     print(f"\n  Dashboard:   http://0.0.0.0:{port}")
     print(f"  Keepalive:   http://0.0.0.0:{port}/api/ping\n")
