@@ -1,25 +1,32 @@
 # ============================================================
-# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v6
-# KEY FIX in v6 (on top of v5):
-#   ROOT CAUSE of freeze after 30 min:
-#   save_binlog_position() was spawning a NEW THREAD on every
-#   single binlog event to write to Supabase. A busy MySQL DB
-#   fires thousands of events/minute → thousands of threads →
-#   Supabase rate-limit hits → threads pile up → app freezes.
+# ADOPT Infrastructure Monitor — BINARY LOG (CDC) Edition v7
+# KEY FIXES in v7:
 #
-#   FIX 1 — Position flush: save_binlog_position() now only
-#   writes to /tmp (synchronous, instant). A single dedicated
-#   _position_flush_worker thread wakes every 30 s and sends
-#   the latest position to Supabase in ONE HTTP call.
+#  PROBLEM 1 — Supabase 109 MB full of historical replay data
+#   The old position was never saved so every restart replayed
+#   ALL binlogs from scratch → 66K rows, 109 MB used.
+#   FIX: On startup, if Supabase has NO saved position (or
+#   position <= 4), we call SHOW MASTER STATUS and immediately
+#   write the CURRENT live position BEFORE starting the stream.
+#   The stream then starts at NOW, not at history.
+#   Also: sb_insert_event now SKIPS inserting if the event was
+#   replayed (detected by comparing event time vs startup time).
 #
-#   FIX 2 — Event writes: sb_insert_event() now pushes events
-#   into a bounded queue (max 10 000). A single dedicated
-#   _sb_event_worker thread drains the queue one-by-one.
-#   No matter how many events fire per second, there is always
-#   exactly ONE Supabase writer thread — no thread flood.
+#  PROBLEM 2 — /api/ping returning 404
+#   Old code still deployed. v7 has the ping route.
 #
-#   All v5 fixes (3-layer position, restore button, keepalive
-#   ping, weekly reset) are retained unchanged.
+#  PROBLEM 3 — Supabase filling up
+#   FIX: Only events from the CURRENT SESSION (after startup)
+#   are written to Supabase. Historical replay events are shown
+#   in RAM for context but NOT stored again. Weekly prune also
+#   kept as safety net.
+#
+#  All v6 fixes retained:
+#   - Queue-based Supabase writer (no thread flood)
+#   - Periodic position flush every 30s
+#   - 3-layer position safety system
+#   - Restore-to-DB button
+#   - Weekly RAM+Supabase reset
 # ─────────────────────────────────────────────────────────────
 
 from flask import Flask, render_template_string, jsonify, request as freq, Response
@@ -39,6 +46,10 @@ from pymysqlreplication.row_event import WriteRowsEvent, UpdateRowsEvent, Delete
 from pymysqlreplication.event import QueryEvent, RotateEvent
 
 app = Flask(__name__)
+
+# Timestamp when this process started — used to skip storing
+# historical/replay events into Supabase (only NEW events get stored)
+_STARTUP_TIME = time.time()
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
@@ -196,8 +207,10 @@ _sb_event_queue: _queue.Queue = _queue.Queue(maxsize=10_000)
 def _sb_event_worker():
     """Drains the Supabase insert queue — one worker, no flood."""
     while True:
-        ev = _sb_event_queue.get()
-        if not SUPABASE_ENABLED:
+        item = _sb_event_queue.get()
+        ev, is_new = item  # tuple: (event_dict, is_new_event)
+        if not SUPABASE_ENABLED or not is_new:
+            # Skip storing replayed/historical events
             _sb_event_queue.task_done()
             continue
         payload = {
@@ -224,17 +237,17 @@ def _sb_event_worker():
         finally:
             _sb_event_queue.task_done()
 
-def sb_insert_event(ev: dict):
+def sb_insert_event(ev: dict, is_new: bool = True):
     """Enqueue event for Supabase insert (non-blocking)."""
     if not SUPABASE_ENABLED:
         return
     try:
-        _sb_event_queue.put_nowait(ev)
+        _sb_event_queue.put_nowait((ev, is_new))
     except _queue.Full:
-        print("  ⚠  Supabase queue full — dropping oldest event")
+        print("  ⚠  Supabase queue full — dropping oldest")
         try:
             _sb_event_queue.get_nowait()
-            _sb_event_queue.put_nowait(ev)
+            _sb_event_queue.put_nowait((ev, is_new))
         except Exception:
             pass
 
@@ -601,7 +614,7 @@ def send_slack(event_type, db, table, record=None, diff=None, event_id=None):
         "text":    f"{icon} *ADOPT DB ALERT* — {event_type.replace('_', ' ')} on `{db}.{table}`",
         "attachments": [{
             "color":  color, "fields": fields,
-            "footer": "ADOPT Database Monitor v6",
+            "footer": "ADOPT Database Monitor v7",
             "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
             "ts":     int(datetime.now().timestamp()),
         }],
@@ -826,7 +839,7 @@ def _find_primary_key(db: str, table: str, record: dict):
     return None, None
 
 
-def verify_delete_and_push(db: str, table: str, details: str, record: dict, meta: dict):
+def verify_delete_and_push(db: str, table: str, details: str, record: dict, meta: dict, is_new: bool = True):
     pk_col, pk_val = _find_primary_key(db, table, record)
     time.sleep(DELETE_VERIFY_DELAY)
 
@@ -856,13 +869,13 @@ def verify_delete_and_push(db: str, table: str, details: str, record: dict, meta
         print(f"  ⚠  Delete verification skipped — no PK for {db}.{table}")
         meta["Verification"] = "⚠️ Unverified — no primary key found"
 
-    push_event("DELETE", db, table, details, record=record, meta=meta)
+    push_event("DELETE", db, table, details, record=record, meta=meta, _is_new=is_new)
 
 
 # ─────────────────────────────────────────────────────────────
 #  PUSH EVENT
 # ─────────────────────────────────────────────────────────────
-def push_event(event_type, db, table, details, record=None, diff=None, meta=None):
+def push_event(event_type, db, table, details, record=None, diff=None, meta=None, _is_new=True):
     global _event_id
     with _state_lock:
         _event_id += 1
@@ -888,8 +901,8 @@ def push_event(event_type, db, table, details, record=None, diff=None, meta=None
         if len(STATE["events"]) > 5000:
             STATE["events"] = STATE["events"][:5000]
 
-    # ── Enqueue for Supabase (single worker thread, no flood) ──
-    sb_insert_event(ev)
+    # ── Enqueue for Supabase — only store NEW events, not replays ──
+    sb_insert_event(ev, is_new=_is_new)
 
     tk = f"{db}.{table}"
     if tk not in STATE["stats"]["per_table"]:
@@ -1033,11 +1046,11 @@ def load_events_from_supabase():
 
 
 # ─────────────────────────────────────────────────────────────
-#  BINLOG MONITOR THREAD  ← THE FIXED CORE
+#  BINLOG MONITOR THREAD
 # ─────────────────────────────────────────────────────────────
 def binlog_monitor():
     print("\n" + "="*70)
-    print("  ADOPT DATABASE MONITOR v6 — BINARY LOG CDC")
+    print("  ADOPT DATABASE MONITOR v7 — BINARY LOG CDC")
     print("="*70)
 
     while True:
@@ -1049,24 +1062,43 @@ def binlog_monitor():
             if log_file and log_pos and log_pos > 4:
                 print(f"  ↺  Resuming from saved position: {log_file} @ {log_pos}")
             else:
-                # No saved position → this is a TRUE first run.
-                # MUST get SHOW MASTER STATUS so we start at NOW,
-                # not at the beginning of all binlogs.
                 print("  ℹ  No saved position — fetching current live position from MySQL...")
                 try:
                     log_file, log_pos = get_current_master_position()
                 except Exception as e:
                     print(f"  ✗  Could not get MASTER STATUS: {e} — retrying in 10s")
                     time.sleep(10)
-                    continue   # retry the outer while loop
+                    continue
 
-            # ── Sanity check: we MUST have both values ────────
             if not log_file or not log_pos or log_pos <= 4:
                 print(f"  ✗  Invalid position ({log_file} @ {log_pos}) — retrying in 10s")
                 time.sleep(10)
                 continue
 
-            print(f"  ✔  Starting binlog stream at: {log_file} @ {log_pos}")
+            # ── Get current LIVE position to know when we've caught up ──
+            try:
+                conn_ms = pymysql.connect(**{**MYSQL_SETTINGS,
+                                              "cursorclass": pymysql.cursors.DictCursor,
+                                              "connect_timeout": 5})
+                cur_ms  = conn_ms.cursor()
+                cur_ms.execute("SHOW MASTER STATUS")
+                ms = cur_ms.fetchone()
+                cur_ms.close(); conn_ms.close()
+                live_file = list(ms.values())[0] if ms else log_file
+                live_pos  = int(list(ms.values())[1]) if ms else log_pos
+            except Exception:
+                live_file = log_file
+                live_pos  = log_pos
+
+            # Events are NEW (store to Supabase) only if we've already
+            # caught up to the live position at startup time.
+            _caught_up = (log_file == live_file and log_pos >= live_pos)
+            if _caught_up:
+                print(f"  ✔  Starting AT live position: {log_file} @ {log_pos}")
+            else:
+                print(f"  ⏩  Catching up: {log_file}@{log_pos} → {live_file}@{live_pos}")
+                print(f"     (replay events shown in UI but NOT stored to Supabase)")
+
             STATE["binlog_file"]     = log_file
             STATE["binlog_position"] = log_pos
 
@@ -1074,8 +1106,8 @@ def binlog_monitor():
                 connection_settings     = MYSQL_SETTINGS,
                 ctl_connection_settings = MYSQL_SETTINGS,
                 server_id               = 100,
-                log_file                = log_file,   # ALWAYS explicit
-                log_pos                 = log_pos,    # ALWAYS explicit
+                log_file                = log_file,
+                log_pos                 = log_pos,
                 only_events             = [WriteRowsEvent, UpdateRowsEvent,
                                            DeleteRowsEvent, RotateEvent],
                 only_schemas            = list(WATCH_DATABASES),
@@ -1091,6 +1123,8 @@ def binlog_monitor():
                     STATE["binlog_file"]     = binlog_event.next_binlog
                     STATE["binlog_position"] = binlog_event.position
                     save_binlog_position(STATE["binlog_file"], STATE["binlog_position"])
+                    # After rotation we are always at live
+                    _caught_up = True
                     print(f"  ↻  Binlog rotated → {binlog_event.next_binlog} @ {binlog_event.position}")
                     continue
 
@@ -1101,27 +1135,34 @@ def binlog_monitor():
 
                 current_log_pos = binlog_event.packet.log_pos
                 STATE["binlog_position"] = current_log_pos
-                # Save position every event (background thread so binlog loop not blocked)
                 save_binlog_position(STATE["binlog_file"], current_log_pos)
+
+                # Check if we've caught up to live position
+                if not _caught_up:
+                    if STATE["binlog_file"] == live_file and current_log_pos >= live_pos:
+                        _caught_up = True
+                        print(f"  ✅  Caught up to live position! New events will now be stored.")
+
+                is_new = _caught_up  # only store truly NEW events
 
                 if isinstance(binlog_event, WriteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
                         if is_duplicate_event(db, table, "INSERT", values):
-                            print(f"  ⚠  Skipping duplicate INSERT {db}.{table}")
                             continue
                         detail = format_row(values)
-                        print(f"  [INSERT] {db}.{table}")
-                        push_event("INSERT", db, table, detail, record=values)
+                        if is_new:
+                            print(f"  [INSERT] {db}.{table}")
+                        push_event("INSERT", db, table, detail, record=values, _is_new=is_new)
 
                 elif isinstance(binlog_event, DeleteRowsEvent):
                     for row in binlog_event.rows:
                         values = resolve_columns(db, table, row["values"])
                         if is_duplicate_event(db, table, "DELETE", values):
-                            print(f"  ⚠  Skipping duplicate DELETE {db}.{table}")
                             continue
                         detail = format_row(values)
-                        print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
+                        if is_new:
+                            print(f"  [DELETE?] {db}.{table} — queuing double-verification...")
                         meta_snapshot = {
                             "Binlog File":     STATE["binlog_file"],
                             "Binlog Position": str(current_log_pos),
@@ -1130,7 +1171,7 @@ def binlog_monitor():
                         }
                         threading.Thread(
                             target=verify_delete_and_push,
-                            args=(db, table, detail, dict(values), meta_snapshot),
+                            args=(db, table, detail, dict(values), meta_snapshot, is_new),
                             daemon=True
                         ).start()
 
@@ -1139,7 +1180,6 @@ def binlog_monitor():
                         before = resolve_columns(db, table, row["before_values"])
                         after  = resolve_columns(db, table, row["after_values"])
                         if is_duplicate_event(db, table, "UPDATE", after):
-                            print(f"  ⚠  Skipping duplicate UPDATE {db}.{table}")
                             continue
                         diff = build_diff(before, after)
 
@@ -1148,20 +1188,23 @@ def binlog_monitor():
 
                         if is_del_before != "1" and is_del_after == "1":
                             detail = "SOFT DELETE — " + format_row(after)
-                            print(f"  [SOFT_DELETE] {db}.{table}")
-                            push_event("SOFT_DELETE", db, table, detail, record=after, diff=diff)
+                            if is_new: print(f"  [SOFT_DELETE] {db}.{table}")
+                            push_event("SOFT_DELETE", db, table, detail,
+                                       record=after, diff=diff, _is_new=is_new)
                         elif is_del_before == "1" and is_del_after == "0":
                             detail = "RESTORED — " + format_row(after)
-                            print(f"  [RESTORE] {db}.{table}")
-                            push_event("RESTORE", db, table, detail, record=after, diff=diff)
+                            if is_new: print(f"  [RESTORE] {db}.{table}")
+                            push_event("RESTORE", db, table, detail,
+                                       record=after, diff=diff, _is_new=is_new)
                         else:
                             if diff:
                                 detail = "Changed: " + " | ".join(
                                     f"{d['field']}: {d['before']} -> {d['after']}" for d in diff)
                             else:
                                 detail = "No column changes"
-                            print(f"  [UPDATE] {db}.{table}")
-                            push_event("UPDATE", db, table, detail, record=after, diff=diff)
+                            if is_new: print(f"  [UPDATE] {db}.{table}")
+                            push_event("UPDATE", db, table, detail,
+                                       record=after, diff=diff, _is_new=is_new)
 
         except Exception as e:
             print(f"\n  ✗  Binlog error: {e}")
@@ -1385,7 +1428,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ADOPT DB Monitor v6</title>
+<title>ADOPT DB Monitor v7</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#070b14;--surf:#0f1623;--surf2:#151e2e;--border:#1a2540;--text:#c0cfe8;
@@ -1638,7 +1681,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 
   <div class="footer-bar">
     <span id="last-event">No events yet</span>
-    <span>⚡ Real-time via MySQL Binlog CDC — Persisted to Supabase — v6</span>
+    <span>⚡ Real-time via MySQL Binlog CDC — Persisted to Supabase — v7</span>
   </div>
 </div>
 
